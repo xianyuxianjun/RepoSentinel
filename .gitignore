@@ -1,0 +1,9 @@
+node_modules/
+dist/
+.repo-sentinel/runs/
+eval/generated/
+.DS_Store
+
+# Local-only artifacts
+tmp/
+/*.pdf
