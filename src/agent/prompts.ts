@@ -17,9 +17,10 @@ export function specialistPrompt(input: AgentRunInput): string {
   const contextInstruction = input.includeContextTools === false
     ? "本角色采用快速模式，不再调用文件工具；仅依据变更清单和检查摘要提交结果。"
     : `请先使用 get_change_context(offset=0, maxChars=${MAX_CONTEXT_PAGE_CHARS}) 分页读取 diff；如返回 nextOffset，继续读取后续分块，再使用 read_file/search_files 获取必要的非敏感上下文。每次尽量用满 maxChars（上限 ${MAX_CONTEXT_PAGE_CHARS}），以减少往返次数。`;
-  return `You are RepoSentinel specialist agent: ${role}.
-
-你的职责：${input.instructions ?? "审查本次 Git 变更，识别有证据支持的问题。"}
+  // 前段（身份、职责、审查方法论）可由操作者配置完全替换；
+  // 以下强制契约尾部始终追加，配置无权删除——删掉它 Agent 就不会再调用 submit_review。
+  const preamble = input.systemPrompt ?? `You are RepoSentinel specialist agent: ${role}.\n\n你的职责：${input.instructions ?? "审查本次 Git 变更，识别有证据支持的问题。"}`;
+  return `${preamble}
 
   首屏只提供变更清单和检查摘要，不嵌入完整 diff，以避免上下文截断。${contextInstruction}${checkInstruction}
 不要执行任意 Shell 命令，不要读取敏感路径，不要修改仓库文件。
@@ -37,18 +38,21 @@ ${JSON.stringify(input.context.changes)}
 /**
  * 构造汇总 Prompt。
  *
- * payload 已在 aggregator.ts 中裁剪并编好 ref，这里只描述“怎么去重”，
- * 明确要求模型不要重写 Finding 正文：正文由主控按 ref 原样搬运。
+ * payload 已在 aggregator.ts 中裁剪并编好 ref。前段可由操作者配置替换，
+ * 但“只引用已有 ref、不重写正文、必须调 submit_merge_plan”这些契约始终由代码强制。
  */
-export function aggregatorPrompt(payload: unknown, failedRoles: string[]): string {
-  return `你是 RepoSentinel 的汇总 Agent。你的任务是去重，不是重写。
+export function aggregatorPrompt(payload: unknown, failedRoles: string[], systemPrompt?: string): string {
+  const preamble = systemPrompt ?? `你是 RepoSentinel 的汇总 Agent。你的任务是去重，不是重写。
 
-汇总输入里的每条 Finding 都带一个 ref（形如 logic#2）。判断哪些 Finding 描述同一个根因，只保留证据最充分、位置最准确的一条，把保留项的 ref 放进 keep。${failedRoles.length ? `
+汇总输入里的每条 Finding 都带一个 ref（形如 logic#2）。判断哪些 Finding 描述同一个根因，只保留证据最充分、位置最准确的一条，把保留项的 ref 放进 keep。`;
+  return `${preamble}${failedRoles.length ? `
+
 以下专家未完成，不要为它们补写结论：${failedRoles.join(", ")}。` : ""}
 
 规则：
 - keep 只能填写汇总输入中出现过的 ref，不能新增、不能编造 Finding。不要参考 Finding 原 id。
 - 不要重复 Finding 正文、证据或严重等级：保留项的正文由主控按 ref 原样搬运，你写的正文会被忽略。
+- high/critical 且 verified 的 Finding 由主控强制保留，你仍应把它们放进 keep。
 - 至少保留一条 Finding；确实全部重复时才允许减少到一条。
 - summary 不超过 500 字，只写合并后的结论；limitations 和 nextActions 只补充专家结果里没有明确的全局信息，不要复述。
 - 不要新增没有出现在专家结果中的事实。检查结果由主控统一执行，不能修改 checks。

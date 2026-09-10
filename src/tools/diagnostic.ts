@@ -1,6 +1,7 @@
 import { createAgentSession, defineTool, SessionManager } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { resolveReviewModel, type ResolvedReviewModel } from "../model-runtime.js";
+import type { ThinkingLevelName } from "../types.js";
 
 /** 诊断命令的窄结果模型，只报告 Session 是否能完成最小工具调用。 */
 export interface AgentDiagnosticResult {
@@ -16,8 +17,10 @@ export interface AgentDiagnosticResult {
 export interface AgentDiagnosticOptions {
   /** 探针超时，默认 45 秒；同时覆盖模型解析阶段。 */
   timeoutMs?: number;
-  /** 配置声明的模型引用；提供时先解析，解析失败直接作为诊断结论返回。 */
+  /** 操作者配置声明的模型引用；提供时先解析，解析失败直接作为诊断结论返回。 */
   modelReference?: string;
+  /** 操作者配置声明的思考档位。 */
+  thinkingLevel?: ThinkingLevelName;
 }
 
 /** 兼容早期的 runAgentDiagnostic(repo, timeoutMs) 调用形式，避免破坏公共 API。 */
@@ -61,7 +64,7 @@ export async function runAgentDiagnostic(repositoryRoot: string, options: AgentD
   if (settings.modelReference) {
     try {
       // 解析阶段也会做凭据/目录刷新，必须同样受超时约束，否则 diagnose 会在这里无限等待。
-      agentModel = await withTimeout(resolveReviewModel(settings.modelReference), timeoutMs, `模型解析超过 ${timeoutMs} ms`);
+      agentModel = await withTimeout(resolveReviewModel(settings.modelReference, { thinkingLevel: settings.thinkingLevel }), timeoutMs, `模型解析超过 ${timeoutMs} ms`);
     } catch (error) {
       // 模型解析失败本身就是一条诊断结论，不应该抛出去变成一次普通崩溃。
       return { ok: false, model: settings.modelReference, activeTools: [], toolCalls: 0, messageSummaries: [], error: error instanceof Error ? error.message : String(error) };

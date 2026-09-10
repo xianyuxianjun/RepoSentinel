@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { initConfig, loadConfig, DEFAULT_MODEL_REFERENCE } from "./config.js";
+import { initConfig, loadOperatorConfig } from "./config.js";
 import { runReview } from "./review.js";
 import { readFile } from "node:fs/promises";
 import { compareEvalSummaries, type EvalSummary } from "./eval.js";
@@ -18,10 +18,10 @@ function usage(): void {
 
 Usage:
   repo-sentinel init [--repo <path>] [--force]
-  repo-sentinel review [--repo <path>] [--base <ref>] [--head <ref>] [--config <path>] [--output <path>] [--allow-dirty] [--dry-run]
+  repo-sentinel review [--repo <path>] [--base <ref>] [--head <ref>] [--config <path>] [--operator-config <path>] [--output <path>] [--allow-dirty] [--dry-run]
   repo-sentinel eval --dataset <path>
     [--baseline <summary.json>] [--max-quality-drop <fraction>] [--max-p95-increase <fraction>]
-  repo-sentinel diagnose [--repo <path>] [--config <path>]
+  repo-sentinel diagnose [--repo <path>] [--operator-config <path>]
 `);
 }
 
@@ -59,10 +59,10 @@ async function main(): Promise<number> {
   if (command === "diagnose") {
     const { runAgentDiagnostic } = await import("./diagnose.js");
     const repo = valueAfter(args, "--repo") ?? process.cwd(); // 诊断的仓库路径。
-    // 复用 review 的配置，保证 diagnose 探测的就是 review 实际会用的模型。
-    const config = await loadConfig(repo, valueAfter(args, "--config"));
-    const diagnostic = await runAgentDiagnostic(repo, { modelReference: config.review.model ?? DEFAULT_MODEL_REFERENCE }); // 执行 Provider 和 Tool Calling 诊断。
-    console.log(JSON.stringify(diagnostic, null, 2));
+    // 模型来自操作者配置，保证 diagnose 探测的就是 review 实际会用的模型。
+    const operator = await loadOperatorConfig(valueAfter(args, "--operator-config"));
+    const diagnostic = await runAgentDiagnostic(repo, { modelReference: operator.config.model, thinkingLevel: operator.config.thinkingLevel });
+    console.log(JSON.stringify({ ...diagnostic, operatorConfigPath: operator.path }, null, 2));
     return diagnostic.ok ? 0 : 2;
   }
   if (command !== "review") { usage(); return 2; }
@@ -73,6 +73,7 @@ async function main(): Promise<number> {
     base: valueAfter(args, "--base"),
     head: valueAfter(args, "--head") ?? "HEAD",
     configPath: valueAfter(args, "--config"),
+    operatorConfigPath: valueAfter(args, "--operator-config"),
     output,
     allowDirty: has(args, "--allow-dirty"),
     dryRun: has(args, "--dry-run"),

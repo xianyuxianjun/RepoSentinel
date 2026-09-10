@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { mkdir } from "node:fs/promises";
 import { resolve } from "node:path";
-import { loadConfig, configHash, DEFAULT_MODEL_REFERENCE } from "./config.js";
+import { loadConfig, configHash, loadOperatorConfig } from "./config.js";
 import { resolveReviewModel, type ResolvedReviewModel } from "./model-runtime.js";
 import { collectGitContext } from "./git.js";
 import { executeCheck, listChecks } from "./checks.js";
@@ -17,6 +17,8 @@ export interface ReviewOptions {
   base?: string;
   head: string;
   configPath?: string;
+  /** 操作者配置路径；不提供时依次看环境变量和默认路径。 */
+  operatorConfigPath?: string;
   output?: string;
   allowDirty: boolean;
   dryRun: boolean;
@@ -76,15 +78,19 @@ export async function runReview(options: ReviewOptions): Promise<{ result: Revie
   await trace.record("run_created", { baseSha: context.base.sha, headSha: context.head.sha, changedFiles: context.changes.length });
   let result: ReviewResult; // 最终 Review 结果，dry-run 和真实运行都会写入它。
   let agentModel: ResolvedReviewModel | undefined; // 本次运行实际使用的模型；dry-run 或解析失败时为 undefined。
+  let operatorPath: string | undefined; // 本次运行读取的操作者配置路径，用于事后审计模型来源。
   // dry-run 仍然生成完整产物，但明确不执行检查和 Agent，避免产生虚假质量指标。
   if (options.dryRun) {
     result = { schemaVersion: 1, mergeRecommendation: "inconclusive", summary: "Dry run：已收集变更并生成检查计划，未调用 Agent 或执行检查。", checks: listChecks(config).map(({ checkId, config: check }) => ({ checkId, category: checkId, commandId: checkId, displayCommand: check.command, status: "skipped" as const, startedAt: new Date().toISOString(), finishedAt: new Date().toISOString(), durationMs: 0, output: "", outputTruncated: false })), findings: [], limitations: ["dry-run 未执行检查"], nextActions: ["移除 --dry-run 以运行实际审查"] };
   } else {
     let executedChecks: CheckResult[] = []; // 主控已经执行过的检查结果。
     try {
-      // 模型先于检查和 Session 解析：配置或认证有问题时应该立刻失败，而不是让每个专家各自报错。
-      agentModel = await resolveReviewModel(config.review.model ?? DEFAULT_MODEL_REFERENCE);
-      await trace.record("agent_model_resolved", { model: agentModel.reference, thinkingLevel: agentModel.thinkingLevel, requested: config.review.model ?? null });
+      // 模型与提示词来自操作者配置，而不是被审查仓库的配置：
+      // 后者随 PR 变更，不能用来决定审查成本和数据出向。
+      const operator = await loadOperatorConfig(options.operatorConfigPath); // 操作者配置及其路径。
+      operatorPath = operator.path;
+      agentModel = await resolveReviewModel(operator.config.model, { thinkingLevel: operator.config.thinkingLevel });
+      await trace.record("agent_model_resolved", { model: agentModel.reference, thinkingLevel: agentModel.thinkingLevel, operatorConfigPath: operator.path, rolePrompts: Object.keys(operator.config.rolePrompts ?? {}), aggregatorPromptOverridden: operator.config.aggregatorPrompt !== undefined });
       // 主控统一执行检查，专家只消费结果，避免多个 Agent 重复运行 npm 命令。
       const enabledChecks = listChecks(config); // 当前配置中启用的检查列表。
       executedChecks = await executeChecksOnce(repositoryRoot, config, enabledChecks.map(({ checkId }) => checkId));
@@ -101,6 +107,7 @@ export async function runReview(options: ReviewOptions): Promise<{ result: Revie
         specialistSeconds: config.review.maxSpecialistSeconds,
         aggregatorSeconds: config.review.maxAggregatorSeconds,
         agentModel,
+        operator: operator.config,
       });
       result = { ...result, mergeRecommendation: computeRecommendation(result, config) };
     } catch (error) {
@@ -127,6 +134,7 @@ export async function runReview(options: ReviewOptions): Promise<{ result: Revie
   metadata.finishedAt = new Date().toISOString();
   // 把实际使用的模型写进 run.json，事后才能解释这份报告是哪个模型给出的。
   if (agentModel) metadata.agent = { provider: agentModel.model.provider, model: agentModel.model.id, thinkingLevel: agentModel.thinkingLevel };
+  if (operatorPath) metadata.operatorConfigPath = operatorPath;
   await writeRun(outputDir, metadata, result, context);
   await trace.record("run_finished", { status: metadata.status, recommendation: result.mergeRecommendation });
   return { result, metadata, outputDir };

@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
 import { access, mkdir, readFile, writeFile } from "node:fs/promises";
-import { dirname, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { effectiveDenyPathPatterns } from "./policy.js";
-import type { AgentRoleConfig, CheckCategory, SentinelConfig } from "./types.js";
+import type { AgentRoleConfig, CheckCategory, OperatorConfig, SentinelConfig, ThinkingLevelName } from "./types.js";
 
 // 默认角色按关注点分工，而不是让一个 Agent 同时承担所有审查任务。
 // 角色配置化后，用户可以增删职责，但仍受数量和格式限制。
@@ -14,12 +14,74 @@ const defaultRoles: AgentRoleConfig[] = [
 ];
 
 /**
- * 未显式配置 review.model 时使用的模型引用。
- * 默认落在具体模型上，是为了让审查成本和行为可预期，而不是跟随 Pi 全局默认模型漂移。
+ * 未提供操作者配置时使用的模型引用。
+ *
+ * 这是一个内置默认值，仓库内的 .repo-sentinel/config.json 无权修改它：
+ * 那份配置随 PR 一起变更，不能用来决定审查成本和数据出向。
  */
 export const DEFAULT_MODEL_REFERENCE = "deepseek/deepseek-v4-flash";
 
 const MAX_MODEL_REFERENCE_LENGTH = 200; // 模型引用长度上限，防止异常配置进入 Trace 和报告。
+const MAX_SYSTEM_PROMPT_CHARS = 4_000; // 单个 Agent 提示词前段的长度上限。
+const thinkingLevels: ThinkingLevelName[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"]; // SDK 支持的档位全集。
+
+/** 缺少操作者配置时的默认值：内置模型、无提示词覆盖。 */
+export const DEFAULT_OPERATOR_CONFIG: OperatorConfig = { version: 1, model: DEFAULT_MODEL_REFERENCE };
+
+/** 操作者配置的默认路径：与 Pi 自身的 agent 配置放在一起，位于被审查仓库之外。 */
+export function defaultOperatorConfigPath(): string {
+  const home = process.env.HOME ?? process.env.USERPROFILE ?? process.cwd(); // 当前用户的主目录。
+  return join(home, ".pi", "agent", "repo-sentinel.json");
+}
+
+function validateSystemPrompt(value: unknown, label: string): string {
+  if (typeof value !== "string" || value.trim() === "" || value.length > MAX_SYSTEM_PROMPT_CHARS) throw new Error(`操作者配置的 ${label} 必须是 1 到 ${MAX_SYSTEM_PROMPT_CHARS} 字的字符串`);
+  return value;
+}
+
+/**
+ * 操作者配置是本地文件，但同样按外部输入校验：
+ * 模型引用与提示词都会进入 SDK 调用和 Trace，必须限制长度并拒绝控制字符。
+ */
+export function validateOperatorConfig(input: unknown): OperatorConfig {
+  if (!input || typeof input !== "object") throw new Error("操作者配置必须是 JSON 对象");
+  const value = input as Record<string, unknown>; // 操作者配置的对象视图。
+  if (value.version !== 1) throw new Error("不支持的操作者配置 version，当前只支持 1");
+  const rawModel = value.model ?? DEFAULT_MODEL_REFERENCE; // 未声明模型时用内置默认。
+  if (typeof rawModel !== "string" || rawModel.trim() === "" || rawModel.length > MAX_MODEL_REFERENCE_LENGTH || /[\u0000-\u001f\u007f]/.test(rawModel)) throw new Error(`操作者配置的 model 必须为 1 到 ${MAX_MODEL_REFERENCE_LENGTH} 字的模型引用，例如 ${DEFAULT_MODEL_REFERENCE}`);
+  let thinkingLevel: ThinkingLevelName | undefined; // 可选的全局思考档位。
+  if (value.thinkingLevel !== undefined) {
+    if (typeof value.thinkingLevel !== "string" || !thinkingLevels.includes(value.thinkingLevel as ThinkingLevelName)) throw new Error(`操作者配置的 thinkingLevel 只能是 ${thinkingLevels.join("、")}`);
+    thinkingLevel = value.thinkingLevel as ThinkingLevelName;
+  }
+  const rawPrompts = value.rolePrompts; // 按角色 ID 的前段提示词覆盖。
+  let rolePrompts: Record<string, string> | undefined;
+  if (rawPrompts !== undefined) {
+    if (!rawPrompts || typeof rawPrompts !== "object" || Array.isArray(rawPrompts)) throw new Error("操作者配置的 rolePrompts 必须是对象");
+    rolePrompts = {};
+    for (const [roleId, prompt] of Object.entries(rawPrompts as Record<string, unknown>)) {
+      if (!/^[a-z][a-z0-9_-]{1,31}$/.test(roleId)) throw new Error(`rolePrompts 的角色 ID 无效：${roleId}`);
+      rolePrompts[roleId] = validateSystemPrompt(prompt, `rolePrompts.${roleId}`);
+    }
+  }
+  const aggregatorPrompt = value.aggregatorPrompt === undefined ? undefined : validateSystemPrompt(value.aggregatorPrompt, "aggregatorPrompt");
+  return { version: 1, model: rawModel.trim(), thinkingLevel, rolePrompts, aggregatorPrompt };
+}
+
+/**
+ * 读取操作者配置。文件不存在时回退到内置默认而不是报错：开箱即用仍然成立，
+ * 但被审查仓库无法参与“用哪个模型、用什么提示词”这个选择。
+ */
+export async function loadOperatorConfig(explicitPath?: string): Promise<{ config: OperatorConfig; path: string }> {
+  const path = resolve(explicitPath ?? process.env.REPO_SENTINEL_OPERATOR_CONFIG ?? defaultOperatorConfigPath()); // 显式参数优先，其次环境变量，最后默认路径。
+  try {
+    return { config: validateOperatorConfig(JSON.parse(await readFile(path, "utf8")) as unknown), path };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { config: validateOperatorConfig(DEFAULT_OPERATOR_CONFIG), path };
+    throw error;
+  }
+}
+
 const MAX_CHANGED_FILES = 1_000; // 单次审查允许的最大变更文件数。
 const MAX_DIFF_BYTES = 5_000_000; // 单次审查允许读取的最大 Diff 字节数。
 const MAX_OUTPUT_BYTES = 5_000_000; // 单次检查允许保存的最大输出字节数。
@@ -59,7 +121,6 @@ export const DEFAULT_CONFIG: SentinelConfig = {
     maxParallelAgents: 4,
     maxSpecialistSeconds: 300,
     maxAggregatorSeconds: 180,
-    model: DEFAULT_MODEL_REFERENCE,
     roles: defaultRoles,
   },
 };
@@ -115,10 +176,6 @@ export function validateConfig(input: unknown): SentinelConfig {
   const maxParallelAgents = typeof review.maxParallelAgents === "number" ? review.maxParallelAgents : DEFAULT_CONFIG.review.maxParallelAgents;
   const maxSpecialistSeconds = typeof review.maxSpecialistSeconds === "number" ? review.maxSpecialistSeconds : typeof review.maxAgentSeconds === "number" ? review.maxAgentSeconds : DEFAULT_CONFIG.review.maxSpecialistSeconds;
   const maxAggregatorSeconds = typeof review.maxAggregatorSeconds === "number" ? review.maxAggregatorSeconds : typeof review.maxAgentSeconds === "number" ? review.maxAgentSeconds : DEFAULT_CONFIG.review.maxAggregatorSeconds;
-  // 模型引用会直接进入 SDK 解析和 Trace，因此限制长度并拒绝控制字符。
-  const rawModel = review.model ?? DEFAULT_CONFIG.review.model; // 用户配置或内置默认的模型引用。
-  if (typeof rawModel !== "string" || rawModel.trim() === "" || rawModel.length > MAX_MODEL_REFERENCE_LENGTH || /[\u0000-\u001f\u007f]/.test(rawModel)) throw new Error(`review.model 必须为 1 到 ${MAX_MODEL_REFERENCE_LENGTH} 字的模型引用，例如 ${DEFAULT_MODEL_REFERENCE}`);
-  const model = rawModel.trim(); // 归一化后的模型引用。
   const rawRoles = review.roles ?? DEFAULT_CONFIG.review.roles; // 用户配置或默认的专家角色列表。
   if (!Array.isArray(rawRoles) || rawRoles.length < 1 || rawRoles.length > 8) throw new Error("review.roles 必须包含 1 到 8 个角色");
   const roleIds = new Set<string>(); // 用于检测重复角色 ID。
@@ -150,7 +207,7 @@ export function validateConfig(input: unknown): SentinelConfig {
       denyPathPatterns: effectiveDenyPathPatterns(Array.isArray(policy.denyPathPatterns) ? policy.denyPathPatterns.filter((item): item is string => typeof item === "string") : []),
       maxOutputBytes,
     },
-    review: { maxChangedFiles, maxDiffBytes, maxAgentTurns, maxAgentSeconds, maxParallelAgents, maxSpecialistSeconds, maxAggregatorSeconds, model, roles },
+    review: { maxChangedFiles, maxDiffBytes, maxAgentTurns, maxAgentSeconds, maxParallelAgents, maxSpecialistSeconds, maxAggregatorSeconds, roles },
   };
 }
 

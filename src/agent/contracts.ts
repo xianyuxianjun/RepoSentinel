@@ -2,7 +2,7 @@
 // 这样 contracts.ts 不依赖具体运行流程，测试可以注入 Fake Session。
 import { createAgentSession } from "@earendil-works/pi-coding-agent";
 import type { AgentSessionEvent } from "@earendil-works/pi-coding-agent";
-import type { CheckResult, GitContext, ReviewResult, SentinelConfig } from "../types.js";
+import type { CheckResult, GitContext, OperatorConfig, ReviewResult, SentinelConfig } from "../types.js";
 import type { ResolvedReviewModel } from "../model-runtime.js";
 import { TraceRecorder } from "../trace.js";
 
@@ -30,6 +30,13 @@ export interface AgentRunInput {
    * 未提供时 createAgentSession 会回退到 Pi 默认设置，测试注入的 Fake Session 也走这条路径。
    */
   agentModel?: ResolvedReviewModel;
+  /**
+   * 操作者级配置（模型与提示词）。
+   * 刻意不来自被审查仓库的配置文件，避免 PR 自己改写审查用的模型和提示词。
+   */
+  operator?: OperatorConfig;
+  /** 当前 Agent 的前段提示词覆盖；强制契约尾部由 prompts 模块始终追加。 */
+  systemPrompt?: string;
   createAgentSession?: AgentSessionFactory;
 }
 

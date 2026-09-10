@@ -11,7 +11,7 @@ RepoSentinel 是一个基于 Pi Agent SDK 的本地代码变更验证 Agent。�
 - Agent 只能按 `checkId` 运行预先配置的检查，不接受任意 Shell 命令。
 - Agent 可通过受控的 `read_file` / `search_files` 工具查看仓库源码；工具会校验仓库边界、符号链接和敏感路径。
 - 必要检查在 Agent 启动前确定性执行，模型不能通过遗漏检查伪造通过结论。
-- 默认使用 `deepseek/deepseek-v4-flash` 执行审查，可通过配置项 `review.model` 换成任意已认证的模型；解析失败会在创建 Session 前明确报错，不会静默回退到其他模型。
+- 审查模型与每个 Agent 的前段提示词由**操作者配置**决定（默认 `~/.pi/agent/repo-sentinel.json`，位于被审查仓库之外），不随 PR 变更；内置默认模型为 `deepseek/deepseek-v4-flash`，解析失败会在创建 Session 前明确报错，不会静默回退到其他模型。
 - 默认使用 4 个专业 Agent 并发分工审查逻辑、测试、安全和工程质量，再由汇总 Agent 去重；汇总 Agent 只提交“保留哪些 Finding 的引用 + 摘要”，Finding 正文由主控按引用原样搬运，因此汇总阶段既不会篡改证据，也不受重新生成正文的输出量限制；角色和并行度均可配置（默认并发 4，可用 `review.maxParallelAgents` 降到 1 回到串行以兼容不支持并发流的 Provider），每个 Agent 都有独立轮次和时间上限。
 - 默认拒绝 dirty worktree、敏感路径、仓库外路径和源代码写操作。
 - 结论由确定性规则重算，模型不能自行宣布通过：必需的检查未完成、或某个专家 Agent 未完成时返回 `inconclusive`（无法完成验证）；已经拿到 `high`/`critical` 且 `verified` 的证据时优先返回 `needs_changes`，避免因为专家缺失而丢掉阻断结论。
@@ -56,11 +56,13 @@ repo-sentinel review --repo /path/to/project --base main
 repo-sentinel review --repo /path/to/project --base main --allow-dirty
 ```
 
-检查全局 Pi 配置是否支持自定义工具调用，并验证 `review.model` 指向的模型是否可用：
+检查 Pi Provider 能否完成自定义工具调用，并验证操作者配置里的模型是否可用：
 
 ```bash
 repo-sentinel diagnose --repo /path/to/project
 ```
+
+输出中会带 `operatorConfigPath`，可以确认本次用的是哪份操作者配置。
 
 `diagnose` 复用与 review 相同的配置和模型，因此它通过就说明 review 的模型链路是通的。
 
@@ -72,11 +74,42 @@ repo-sentinel diagnose --repo /path/to/project
 
 配置文件为目标仓库下的 `.repo-sentinel/config.json`。检查命令必须使用 MVP 支持的预定义 npm 命令。默认不允许 Shell 管道、重定向、命令替换或网络工具。检查摘要会脱敏 token、密码、Bearer 凭据和 PEM 私钥。
 
-多 Agent 运行参数位于 `review`：`model`（默认 `deepseek/deepseek-v4-flash`）指定本次审查使用的模型，支持 `provider/modelId` 形式以及 `:thinkingLevel` 后缀（如 `deepseek/deepseek-v4-flash:high`）；`maxParallelAgents`（默认 4；Provider 有限流或串行化流式请求时调到 1）、`maxSpecialistSeconds`（默认 300）和 `maxAggregatorSeconds`（默认 180）分别限制并发数、单个专家和汇总 Agent 的运行时间；`maxAgentTurns`（默认 40）仍限制每个 Session 的轮次；它既要和 `maxDiffBytes` 与分页上限匹配，也取决于所选模型的话多少——实测同样 diff 下 flash 的工具调用次数约为 pro 的两倍，换模型后应重新核对。
+多 Agent 运行参数位于 `review`：`maxParallelAgents`（默认 4；Provider 有限流或串行化流式请求时调到 1）、`maxSpecialistSeconds`（默认 300）和 `maxAggregatorSeconds`（默认 180）分别限制并发数、单个专家和汇总 Agent 的运行时间；`maxAgentTurns`（默认 40）仍限制每个 Session 的轮次；它既要和 `maxDiffBytes` 与分页上限匹配，也取决于所选模型的话多少——实测同样 diff 下 flash 的工具调用次数约为 pro 的两倍，换模型后应重新核对。
 
-`review.model` 只接受 Pi 中已配置认证的模型（`~/.pi/agent/auth.json`）。解析失败会直接终止本次审查并写入报告，不会回退到其他模型。实际使用的 `provider/modelId` 和思考档位记录在 `run.json` 的 `agent` 字段和 `trace.jsonl` 的 `agent_model_resolved` 事件中。
+`review.model` 已废弃：模型现在只从操作者配置读取，写在仓库配置里不会被使用（见下一节）。
 
 资源边界也由配置校验强制限制：`maxChangedFiles` 不超过 1,000，`maxDiffBytes` 和 `commandPolicy.maxOutputBytes` 各不超过 5,000,000，所有限制必须是有限正数。
+
+### 操作者配置（模型与 Agent 提示词）
+
+模型和每个 Agent 的提示词**不在仓库配置里**，而在仓库之外的操作者配置中：
+
+- 默认路径：`~/.pi/agent/repo-sentinel.json`
+- 环境变量：`REPO_SENTINEL_OPERATOR_CONFIG`
+- 命令行：`--operator-config <path>`（优先级最高）
+
+```json
+{
+  "version": 1,
+  "model": "deepseek/deepseek-v4-flash",
+  "thinkingLevel": "low",
+  "rolePrompts": {
+    "logic": "你是一名资深后端工程师，重点关注业务逻辑、边界条件与潜在回归。"
+  },
+  "aggregatorPrompt": "你是 RepoSentinel 的汇总 Agent。"
+}
+```
+
+- `model`：支持 `provider/modelId`，也可带 `:high` 之类的档位后缀；档位优先级为「引用里的档位 > `thinkingLevel` > 内置默认」。模型必须在 Pi 中已配置认证（`~/.pi/agent/auth.json`），解析失败会直接终止本次审查并写入报告。
+- `rolePrompts`：按**角色 ID** 替换专家的前段提示词（角色 ID 来自仓库配置的 `review.roles[].id`）。
+- `aggregatorPrompt`：替换汇总 Agent 的前段提示词。
+- 文件不存在时回退到内置默认，开箱即用仍然成立。
+
+**为什么放在仓库之外**：仓库内的 `.repo-sentinel/config.json` 随 PR 一起变更，如果模型写在那里，就等于让被审查对象自己决定审查成本和代码会被送到哪个端点。把 `model` 写进仓库配置也不会被读取（有测试锁定这个行为）。
+
+**强制契约不可覆盖**：提示词只能替换前段（身份、职责、审查方法论）。必须调用 `submit_review` / `submit_merge_plan`、证据类型与严重等级取值、允许定位的变更文件路径、禁用 shell 这些尾部约束始终由代码追加，配置无权删除——否则 Agent 不会再提交结构化结果，流水线直接失效。
+
+实际使用的 `provider/modelId`、思考档位和 `operatorConfigPath` 记录在 `run.json`，`trace.jsonl` 的 `agent_model_resolved` 事件会同时记录角色提示词覆盖了哪些 Agent。
 
 专家角色通过 `review.roles` 配置。每个角色包含唯一的 `id`、职责提示词 `instructions` 和 `enabled` 开关，支持在不改代码的情况下增删领域专家；角色数限制为 1-8，至少启用一个角色。每次运行的 `trace.jsonl` 会记录角色列表、成功/失败数量、并发上限和专家阶段耗时。
 

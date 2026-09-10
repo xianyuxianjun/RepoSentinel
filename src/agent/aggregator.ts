@@ -4,6 +4,7 @@ import { validateReviewResult } from "../report.js";
 import { runSession } from "./session.js";
 import { boundedPreview } from "../tools/context.js";
 import { aggregatorPrompt } from "./prompts.js";
+import { DEFAULT_THINKING_LEVEL } from "../model-runtime.js";
 import type { MultiAgentRunInput, SpecialistResult } from "./contracts.js";
 import { createSubmitMergePlanTool, validateMergePlan, type ReviewToolState } from "../tools/review.js";
 
@@ -166,7 +167,7 @@ export async function runAggregatorAgent(input: MultiAgentRunInput, successes: S
   // 汇总 Agent 与专家使用同一个已解析模型，避免同一份报告里混用不同模型。
   const { session } = await sessionFactory({
     cwd: input.repositoryRoot,
-    thinkingLevel: input.agentModel?.thinkingLevel ?? "low",
+    thinkingLevel: input.agentModel?.thinkingLevel ?? DEFAULT_THINKING_LEVEL,
     model: input.agentModel?.model,
     modelRuntime: input.agentModel?.modelRuntime,
     tools: ["submit_merge_plan"],
@@ -175,7 +176,7 @@ export async function runAggregatorAgent(input: MultiAgentRunInput, successes: S
   }); // 汇总 Agent 的 Pi 会话。
   state.activeSession = session; // 让 submit_merge_plan 成功后可以主动终止会话。
   await input.trace.record("aggregator_context_bounded", { agentRole: "aggregator", specialistCount: prepared.payload.length, payloadChars: prepared.payloadChars, maxContextChars: MAX_AGGREGATOR_CONTEXT_CHARS, maxFindingsPerSpecialist: 30, truncatedFindings: prepared.truncatedFindings, trimmedSections: prepared.trimmedSections, findingRefs: prepared.refs.size });
-  const run = await runSession({ session, trace: input.trace, role: "aggregator", maxTurns: input.maxTurns ?? input.config.review.maxAgentTurns, maxSeconds: input.aggregatorSeconds ?? input.maxSeconds ?? input.config.review.maxAggregatorSeconds, submitToolName: "submit_merge_plan" }, aggregatorPrompt(prepared.payload, failedRoles), () => state.submitted); // 执行汇总 Prompt 和提交工具。
+  const run = await runSession({ session, trace: input.trace, role: "aggregator", maxTurns: input.maxTurns ?? input.config.review.maxAgentTurns, maxSeconds: input.aggregatorSeconds ?? input.maxSeconds ?? input.config.review.maxAggregatorSeconds, submitToolName: "submit_merge_plan" }, aggregatorPrompt(prepared.payload, failedRoles, input.operator?.aggregatorPrompt), () => state.submitted); // 执行汇总 Prompt 和提交工具。
   // 工具层已经校验过一次；这里再校验一次，作为不依赖工具实现的可信边界。
   const plan = validateMergePlan(run.submitted, prepared.refs); // 已校验的汇总去重方案。
   const assembled = assembleMergedResult({ originals: prepared.originals, plan, checks: input.initialChecks ?? [], specialists: successes, truncatedFindings: prepared.truncatedFindings }); // 回查专家原文并按 ref 组装最终结果。

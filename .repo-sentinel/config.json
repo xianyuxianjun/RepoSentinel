@@ -9,8 +9,7 @@
     "lint": {
       "command": "npm run lint",
       "required": false,
-      "timeoutSeconds": 120,
-      "enabled": false
+      "timeoutSeconds": 120
     },
     "typecheck": {
       "command": "npm run typecheck",
@@ -53,7 +52,6 @@
     "maxParallelAgents": 4,
     "maxSpecialistSeconds": 300,
     "maxAggregatorSeconds": 180,
-    "model": "deepseek/deepseek-v4-flash",
     "roles": [
       {
         "id": "logic",

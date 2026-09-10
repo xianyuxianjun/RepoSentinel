@@ -34,7 +34,7 @@ export async function runMultiAgentReview(input: MultiAgentRunInput): Promise<Re
   const outcomes = await mapWithConcurrency(roles, input.maxParallelAgents ?? 4, async (role) => { // 按并发上限运行所有专家。
     await input.trace.record("specialist_start", { agentRole: role.id });
     try {
-      const result = await runReviewAgent({ ...input, role: role.id, instructions: role.instructions, includeCheckTool: false, includeContextTools: true, maxSeconds: input.specialistSeconds ?? input.config.review.maxSpecialistSeconds });
+      const result = await runReviewAgent({ ...input, role: role.id, instructions: role.instructions, systemPrompt: input.operator?.rolePrompts?.[role.id], includeCheckTool: false, includeContextTools: true, maxSeconds: input.specialistSeconds ?? input.config.review.maxSpecialistSeconds });
       await input.trace.record("specialist_end", { agentRole: role.id, findings: result.findings.length });
       return { role: role.id, result } satisfies SpecialistResult;
     } catch (error) {

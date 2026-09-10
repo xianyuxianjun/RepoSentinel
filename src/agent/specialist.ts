@@ -3,6 +3,7 @@ import type { CheckResult, ReviewResult } from "../types.js";
 import { validateReviewResult } from "../report.js";
 import { runSession } from "./session.js";
 import { specialistPrompt } from "./prompts.js";
+import { DEFAULT_THINKING_LEVEL } from "../model-runtime.js";
 import type { AgentRunInput } from "./contracts.js";
 import { createSpecialistTools, type ReviewToolState } from "../tools/review.js";
 
@@ -32,7 +33,7 @@ export async function runReviewAgent(input: AgentRunInput): Promise<ReviewResult
   // model/modelRuntime 只在配置里显式声明了模型时才传入，未声明时保持 Pi 默认行为。
   const { session } = await sessionFactory({
     cwd: input.repositoryRoot,
-    thinkingLevel: input.agentModel?.thinkingLevel ?? "low",
+    thinkingLevel: input.agentModel?.thinkingLevel ?? DEFAULT_THINKING_LEVEL,
     model: input.agentModel?.model,
     modelRuntime: input.agentModel?.modelRuntime,
     tools: toolNames,

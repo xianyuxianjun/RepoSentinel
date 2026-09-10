@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { DEFAULT_CONFIG, validateConfig } from "../dist/config.js";
+import { DEFAULT_CONFIG, DEFAULT_OPERATOR_CONFIG, validateConfig, validateOperatorConfig } from "../dist/config.js";
 import { resolveReviewModel } from "../dist/model-runtime.js";
 import { assertSafeCommand, isPathAllowed } from "../dist/policy.js";
 import { computeRecommendation, renderMarkdown, validateReviewResult } from "../dist/report.js";
@@ -10,7 +10,7 @@ import { MAX_READ_LINE_NUMBER, MAX_READ_LINE_SPAN, readRepositoryFile, searchRep
 import { writeRun } from "../dist/report.js";
 import { executeCheck } from "../dist/checks.js";
 import { getContextChunk, runMultiAgentReview } from "../dist/agent.js";
-import { specialistPrompt } from "../dist/agent/prompts.js";
+import { specialistPrompt, aggregatorPrompt } from "../dist/agent/prompts.js";
 import { assembleMergedResult, buildAggregatorPayload } from "../dist/agent/aggregator.js";
 import { validateMergePlan } from "../dist/tools/review.js";
 import { executeChecksOnce } from "../dist/review.js";
@@ -82,21 +82,51 @@ test("validates bounded multi-agent review settings", () => {
   assert.throws(() => validateConfig({ version: 1, review: { maxDiffBytes: Infinity } }), /有限正数/);
 });
 
-test("validates the configured review model reference", () => {
-  assert.equal(DEFAULT_CONFIG.review.model, "deepseek/deepseek-v4-flash");
-  assert.equal(validateConfig({ version: 1 }).review.model, "deepseek/deepseek-v4-flash");
-  assert.equal(validateConfig({ version: 1, review: { model: " gpt/gpt-5.6-terra " } }).review.model, "gpt/gpt-5.6-terra");
-  assert.equal(validateConfig({ version: 1, review: { model: "deepseek/deepseek-v4-flash:high" } }).review.model, "deepseek/deepseek-v4-flash:high");
-  assert.throws(() => validateConfig({ version: 1, review: { model: "" } }), /review\.model/);
-  assert.throws(() => validateConfig({ version: 1, review: { model: "   " } }), /review\.model/);
-  assert.throws(() => validateConfig({ version: 1, review: { model: "a".repeat(201) } }), /review\.model/);
-  assert.throws(() => validateConfig({ version: 1, review: { model: "deepseek/deep\nseek-pro" } }), /review\.model/);
-  assert.throws(() => validateConfig({ version: 1, review: { model: 42 } }), /review\.model/);
+test("validates the operator config that owns the model and the agent prompts", () => {
+  assert.equal(DEFAULT_OPERATOR_CONFIG.model, "deepseek/deepseek-v4-flash");
+  assert.equal(validateOperatorConfig({ version: 1 }).model, "deepseek/deepseek-v4-flash");
+  assert.equal(validateOperatorConfig({ version: 1, model: " gpt/gpt-5.6-terra " }).model, "gpt/gpt-5.6-terra");
+  assert.equal(validateOperatorConfig({ version: 1, model: "deepseek/deepseek-v4-flash:high" }).model, "deepseek/deepseek-v4-flash:high");
+  assert.equal(validateOperatorConfig({ version: 1, thinkingLevel: "high" }).thinkingLevel, "high");
+  assert.throws(() => validateOperatorConfig({ version: 2 }), /version/);
+  assert.throws(() => validateOperatorConfig({ version: 1, model: "" }), /model/);
+  assert.throws(() => validateOperatorConfig({ version: 1, model: "a".repeat(201) }), /model/);
+  assert.throws(() => validateOperatorConfig({ version: 1, model: "deepseek/deep\nseek" }), /model/);
+  assert.throws(() => validateOperatorConfig({ version: 1, thinkingLevel: "turbo" }), /thinkingLevel/);
+  assert.throws(() => validateOperatorConfig({ version: 1, rolePrompts: { "bad role": "x" } }), /角色 ID/);
+  assert.throws(() => validateOperatorConfig({ version: 1, rolePrompts: { logic: "" } }), /rolePrompts\.logic/);
+  assert.throws(() => validateOperatorConfig({ version: 1, aggregatorPrompt: "x".repeat(4_001) }), /aggregatorPrompt/);
+});
+
+test("ignores the reviewed repository's own model field", () => {
+  // 模型现在只由操作者配置决定。即使有人在 PR 里改仓库配置，也不会被读取。
+  const config = validateConfig({ version: 1, review: { model: "evil/expensive-model" } });
+  assert.equal("model" in config.review, false);
+});
+
+test("lets the operator override the specialist preamble but keeps the mandatory contract", () => {
+  const base = { role: "logic", instructions: "内置职责", context: { base: {}, head: {}, changes: [] }, initialChecks: [] };
+  assert.equal(specialistPrompt(base).includes("内置职责"), true);
+  const overridden = specialistPrompt({ ...base, systemPrompt: "你是我的自定义审计员。" });
+  assert.equal(overridden.startsWith("你是我的自定义审计员。"), true);
+  assert.equal(overridden.includes("内置职责"), false); // 前段被完全替换。
+  // 强制契约必须保留：删掉它 Agent 就不会再调用 submit_review。
+  assert.equal(overridden.includes("最终必须通过 submit_review 提交结构化结果"), true);
+  assert.equal(overridden.includes("不要执行任意 Shell 命令"), true);
+  assert.equal(overridden.includes("maxChars=32000"), true);
+});
+
+test("lets the operator override the aggregator preamble but keeps the merge contract", () => {
+  assert.equal(aggregatorPrompt([], []).startsWith("你是 RepoSentinel 的汇总 Agent"), true);
+  const overridden = aggregatorPrompt([], [], "你是我的合并员。");
+  assert.equal(overridden.startsWith("你是我的合并员。"), true);
+  assert.equal(overridden.includes("你是 RepoSentinel 的汇总 Agent"), false);
+  assert.equal(overridden.includes("最终必须调用 submit_merge_plan"), true);
 });
 
 test("reports an actionable error when the model reference cannot be resolved", async () => {
   const emptyRuntime = { getAvailable: async () => [] }; // 不访问真实 Pi 配置和网络的 Runtime 替身。
-  await assert.rejects(resolveReviewModel("deepseek/does-not-exist", emptyRuntime), /无法解析模型/);
+  await assert.rejects(resolveReviewModel("deepseek/does-not-exist", { modelRuntime: emptyRuntime }), /无法解析模型/);
 });
 
 test("validates configurable specialist roles", () => {
@@ -458,14 +488,18 @@ test("reports findings dropped by the aggregator budget instead of silently losi
   assert.equal(merged.limitations[0].includes("3 条 Finding"), true);
 });
 
-test("resolves a model reference and strips the thinking level from the reported reference", async () => {
+test("resolves a model reference and applies the thinking level precedence", async () => {
   const model = { provider: "deepseek", id: "deepseek-v4-flash", api: "openai-completions", name: "DeepSeek V4 Flash" };
   const runtime = { getAvailable: async () => [model] }; // 不访问真实 Pi 配置和网络的 Runtime 替身。
-  const resolved = await resolveReviewModel("deepseek/deepseek-v4-flash:high", runtime);
+  const resolved = await resolveReviewModel("deepseek/deepseek-v4-flash:high", { modelRuntime: runtime });
   assert.equal(resolved.model, model);
   assert.equal(resolved.reference, "deepseek/deepseek-v4-flash"); // reference 不含思考档位。
-  assert.equal(resolved.thinkingLevel, "high");
   assert.equal(resolved.modelRuntime, runtime); // 复用传入的 Runtime，避免重复加载模型目录。
+  // 优先级：模型引用里的档位 > 操作者配置的档位 > 内置默认。
+  assert.equal(resolved.thinkingLevel, "high");
+  assert.equal((await resolveReviewModel("deepseek/deepseek-v4-flash:high", { modelRuntime: runtime, thinkingLevel: "max" })).thinkingLevel, "high");
+  assert.equal((await resolveReviewModel("deepseek/deepseek-v4-flash", { modelRuntime: runtime, thinkingLevel: "max" })).thinkingLevel, "max");
+  assert.equal((await resolveReviewModel("deepseek/deepseek-v4-flash", { modelRuntime: runtime })).thinkingLevel, "low");
 });
 
 test("deduplicates duplicate findings end to end through the merge-plan tool", async () => {
