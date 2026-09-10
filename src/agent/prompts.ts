@@ -48,7 +48,7 @@ export function aggregatorPrompt(payload: unknown, failedRoles: string[]): strin
 
 规则：
 - keep 只能填写汇总输入中出现过的 ref，不能新增、不能编造 Finding。不要参考 Finding 原 id。
-- 不要重复 Listing 正文、证据或严重等级：保留项的正文由主控按 ref 原样搬运，你写的正文会被忽略。
+- 不要重复 Finding 正文、证据或严重等级：保留项的正文由主控按 ref 原样搬运，你写的正文会被忽略。
 - 至少保留一条 Finding；确实全部重复时才允许减少到一条。
 - summary 不超过 500 字，只写合并后的结论；limitations 和 nextActions 只补充专家结果里没有明确的全局信息，不要复述。
 - 不要新增没有出现在专家结果中的事实。检查结果由主控统一执行，不能修改 checks。

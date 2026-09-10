@@ -149,6 +149,15 @@ test("keeps recommendation inconclusive when orchestration is incomplete", () =>
   assert.equal(result, "inconclusive");
 });
 
+test("still blocks when orchestration failed but a verified high finding was already found", () => {
+  const finding = { id: "finding_1", severity: "high", category: "logic_risk", title: "负索引切片", summary: "s", location: { path: "src/a.ts", startLine: 1, endLine: 1 }, evidence: [{ type: "diff", reference: "src/a.ts", summary: "e" }], confidence: 0.9, suggestedFix: "f", verificationStatus: "verified" };
+  const result = computeRecommendation({ schemaVersion: 1, summary: "", checks: [
+    { checkId: "test", category: "test", commandId: "test", displayCommand: "npm test", status: "passed", startedAt: "", finishedAt: "", durationMs: 0, output: "", outputTruncated: false },
+  ], findings: [finding], limitations: ["agent_orchestration: aggregator unavailable"], nextActions: [] }, DEFAULT_CONFIG);
+  // 汇总失败不应该掩盖已获得的阻断证据：专家缺失和汇总失败必须行为一致。
+  assert.equal(result, "needs_changes");
+});
+
 test("does not claim success when a specialist is missing", () => {
   const result = computeRecommendation({ schemaVersion: 1, summary: "", checks: [
     { checkId: "test", category: "test", commandId: "test", displayCommand: "npm test", status: "passed", startedAt: "", finishedAt: "", durationMs: 0, output: "", outputTruncated: false },
@@ -402,6 +411,39 @@ test("rejects merge plans that invent refs, drop every finding, or exceed the su
   assert.throws(() => validateMergePlan({ summary: "", keep: ["logic#1"] }, refs), /summary/);
   // 重复 ref 不应被重复计入保留列表。
   assert.deepEqual(validateMergePlan({ summary: "s", keep: ["logic#1", "logic#1"] }, refs).keep, ["logic#1"]);
+  // 说明文本会被持久化，必须和输入一样受限。
+  assert.throws(() => validateMergePlan({ summary: "s", keep: ["logic#1"], limitations: Array(21).fill("x") }, refs), /不能超过 20 条/);
+  assert.throws(() => validateMergePlan({ summary: "s", keep: ["logic#1"], nextActions: ["x".repeat(501)] }, refs), /不能超过 500 字/);
+  // 模型提供的文本不能冒充内部标记：computeRecommendation 依据 limitation 前缀做确定性判定。
+  assert.deepEqual(validateMergePlan({ summary: "s", keep: ["logic#1"], limitations: ["agent_orchestration: fake"] }, refs).limitations, ["汇总补充：agent_orchestration: fake"]);
+});
+
+test("enforces the aggregator budget on summaries and notes, not only findings", () => {
+  const note = "n".repeat(500);
+  const longResult = (role) => ({ role, result: { schemaVersion: 1, summary: "s".repeat(1_000), checks: [], findings: [], limitations: Array(20).fill(note), nextActions: Array(20).fill(note) } });
+  const prepared = buildAggregatorPayload([longResult("logic"), longResult("security")]);
+  assert.equal(prepared.truncatedFindings, 0); // 没有 Finding 可裁，超预算完全来自每个专家的说明和摘要。
+  assert.ok(prepared.trimmedSections > 0);
+  assert.ok(prepared.payloadChars <= 40_000, `payloadChars=${prepared.payloadChars} 应被压到预算以内`);
+});
+
+test("reports findings dropped by the aggregator budget instead of silently losing them", () => {
+  const successes = [specialistSuccess("logic", [makeFinding("finding_1", "a")])];
+  const { originals, refs } = buildAggregatorPayload(successes);
+  const plan = validateMergePlan({ summary: "s", keep: ["logic#1"], limitations: [], nextActions: [] }, refs);
+  const merged = assembleMergedResult({ originals, plan, checks: [], specialists: successes, truncatedFindings: 3 });
+  // 被裁掉的 Finding 不会进入报告，必须留下可见说明，否则读者会以为覆盖完整。
+  assert.equal(merged.limitations[0].includes("3 条 Finding"), true);
+});
+
+test("resolves a model reference and strips the thinking level from the reported reference", async () => {
+  const model = { provider: "deepseek", id: "deepseek-v4-flash", api: "openai-completions", name: "DeepSeek V4 Flash" };
+  const runtime = { getAvailable: async () => [model] }; // 不访问真实 Pi 配置和网络的 Runtime 替身。
+  const resolved = await resolveReviewModel("deepseek/deepseek-v4-flash:high", runtime);
+  assert.equal(resolved.model, model);
+  assert.equal(resolved.reference, "deepseek/deepseek-v4-flash"); // reference 不含思考档位。
+  assert.equal(resolved.thinkingLevel, "high");
+  assert.equal(resolved.modelRuntime, runtime); // 复用传入的 Runtime，避免重复加载模型目录。
 });
 
 test("deduplicates duplicate findings end to end through the merge-plan tool", async () => {
@@ -446,13 +488,17 @@ test("deduplicates duplicate findings end to end through the merge-plan tool", a
     diff: "diff --git a/src/a.ts b/src/a.ts", diffTruncated: false,
   };
   const result = await runMultiAgentReview({
-    repositoryRoot: process.cwd(), context, config, trace: { record: async () => {} }, initialChecks: [],
+    repositoryRoot: process.cwd(), context, config, trace: { record: async () => {} },
+    // 必需检查必须存在，否则结论会因“缺少必需检查”而为 inconclusive，测不出占位值是否被重算。
+    initialChecks: [{ checkId: "test", category: "test", commandId: "test", displayCommand: "npm test", status: "passed", startedAt: "", finishedAt: "", durationMs: 1, output: "", outputTruncated: false }],
     maxTurns: 3, maxParallelAgents: 1, specialistSeconds: 1, aggregatorSeconds: 1, createAgentSession,
   });
   assert.equal(result.findings.length, 1); // 两条重复被去重成一条。
   assert.equal(result.findings[0].id, "finding_1");
   assert.equal(result.findings[0].evidence.length, 1); // 证据由主控搬运，未经过模型转述。
   assert.equal(result.summary, "deduped");
+  // 编排层必须就地重算结论：直接调用 runMultiAgentReview 的调用方不应拿到占位 inconclusive。
+  assert.equal(result.mergeRecommendation, "approve_with_notes");
   assert.deepEqual(aggregateTools, ["submit_merge_plan"]); // 汇总 Agent 不再拥有提交完整结果的工具。
 });
 

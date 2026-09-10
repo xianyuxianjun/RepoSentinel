@@ -1,4 +1,5 @@
 import type { AgentTelemetry, ReviewResult, ReviewTelemetry } from "../types.js";
+import { computeRecommendation } from "../report.js";
 import { runReviewAgent } from "./specialist.js";
 import { runAggregatorAgent, mergeSpecialistResults } from "./aggregator.js";
 import { combineTelemetry, asAgentTelemetry } from "./telemetry.js";
@@ -33,7 +34,7 @@ export async function runMultiAgentReview(input: MultiAgentRunInput): Promise<Re
   const outcomes = await mapWithConcurrency(roles, input.maxParallelAgents ?? 4, async (role) => { // 按并发上限运行所有专家。
     await input.trace.record("specialist_start", { agentRole: role.id });
     try {
-      const result = await runReviewAgent({ ...input, role: role.id, instructions: role.instructions, includeCheckTool: false, includeContextTools: true, maxSeconds: input.specialistSeconds ?? 90 });
+      const result = await runReviewAgent({ ...input, role: role.id, instructions: role.instructions, includeCheckTool: false, includeContextTools: true, maxSeconds: input.specialistSeconds ?? input.config.review.maxSpecialistSeconds });
       await input.trace.record("specialist_end", { agentRole: role.id, findings: result.findings.length });
       return { role: role.id, result } satisfies SpecialistResult;
     } catch (error) {
@@ -61,7 +62,10 @@ export async function runMultiAgentReview(input: MultiAgentRunInput): Promise<Re
     const specialistTelemetry = successes.map(({ result }) => asAgentTelemetry(result.telemetry)).filter((value): value is AgentTelemetry => Boolean(value)); // 成功专家的 telemetry 列表。
     const combined = combineTelemetry([...specialistTelemetry, ...(aggregatorTelemetry ? [aggregatorTelemetry] : [])]); // 合并所有成功 Session 的统计。
     const telemetry: ReviewTelemetry = { usageAvailable: combined.usageAvailable, specialistCount: roles.length, successfulSpecialists: successes.length, failedSpecialists: failedRoles.length, specialistDurationMs, aggregatorDurationMs: aggregatorTelemetry?.durationMs, totalDurationMs: Date.now() - startedAt, turns: combined.turns, toolCalls: combined.toolCalls, inputTokens: combined.inputTokens, outputTokens: combined.outputTokens, cacheReadTokens: combined.cacheReadTokens, cacheWriteTokens: combined.cacheWriteTokens, totalCost: combined.totalCost };
-    return { ...aggregated, limitations, telemetry };
+    // 结论必须在编排层就地重算：runMultiAgentReview 是导出 API，直接调用它的调用方
+    // 不应该拿到 assembleMergedResult 留下的占位 inconclusive。
+    const withLimitations = { ...aggregated, limitations }; // 参与确定性判定的结果视图。
+    return { ...withLimitations, mergeRecommendation: computeRecommendation(withLimitations, input.config), telemetry };
   } catch (error) {
     // 汇总失败不丢弃已经完成的专家结果，但必须留下 agent_orchestration limitation。
     const reason = error instanceof Error ? error.message : String(error);
@@ -69,6 +73,6 @@ export async function runMultiAgentReview(input: MultiAgentRunInput): Promise<Re
     const merged = mergeSpecialistResults(successes, input.initialChecks, failedRoles, reason);
     const specialistTelemetry = successes.map(({ result }) => asAgentTelemetry(result.telemetry)).filter((value): value is AgentTelemetry => Boolean(value));
     const combined = combineTelemetry(specialistTelemetry);
-    return { ...merged, telemetry: { usageAvailable: combined.usageAvailable, specialistCount: roles.length, successfulSpecialists: successes.length, failedSpecialists: failedRoles.length, specialistDurationMs, totalDurationMs: Date.now() - startedAt, turns: combined.turns, toolCalls: combined.toolCalls, inputTokens: combined.inputTokens, outputTokens: combined.outputTokens, cacheReadTokens: combined.cacheReadTokens, cacheWriteTokens: combined.cacheWriteTokens, totalCost: combined.totalCost } };
+    return { ...merged, mergeRecommendation: computeRecommendation(merged, input.config), telemetry: { usageAvailable: combined.usageAvailable, specialistCount: roles.length, successfulSpecialists: successes.length, failedSpecialists: failedRoles.length, specialistDurationMs, totalDurationMs: Date.now() - startedAt, turns: combined.turns, toolCalls: combined.toolCalls, inputTokens: combined.inputTokens, outputTokens: combined.outputTokens, cacheReadTokens: combined.cacheReadTokens, cacheWriteTokens: combined.cacheWriteTokens, totalCost: combined.totalCost } };
   }
 }

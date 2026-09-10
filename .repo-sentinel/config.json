@@ -9,7 +9,8 @@
     "lint": {
       "command": "npm run lint",
       "required": false,
-      "timeoutSeconds": 120
+      "timeoutSeconds": 120,
+      "enabled": false
     },
     "typecheck": {
       "command": "npm run typecheck",

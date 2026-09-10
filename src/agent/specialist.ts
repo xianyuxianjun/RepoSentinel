@@ -41,7 +41,7 @@ export async function runReviewAgent(input: AgentRunInput): Promise<ReviewResult
   }); // 当前专家的 Pi 会话。
   state.activeSession = session;
   try {
-    const run = await runSession({ session, trace: input.trace, role, maxTurns: input.maxTurns ?? 12, maxSeconds: input.maxSeconds ?? 300 }, specialistPrompt(input), () => state.submitted); // 执行 Prompt、工具调用和生命周期限制。
+    const run = await runSession({ session, trace: input.trace, role, maxTurns: input.maxTurns ?? input.config.review.maxAgentTurns, maxSeconds: input.maxSeconds ?? input.config.review.maxSpecialistSeconds }, specialistPrompt(input), () => state.submitted); // 执行 Prompt、工具调用和生命周期限制。
     const validated = validateReviewResult(run.submitted, checkResults, changedPaths); // 对 Agent 提交的结果做最终业务校验。
     const telemetry = { ...run.telemetry, durationMs: run.telemetry.durationMs || 0 }; // 补齐当前专家的运行统计。
     await input.trace.record("agent_end", { agentRole: role, findings: validated.findings.length, checks: validated.checks.length, telemetry });

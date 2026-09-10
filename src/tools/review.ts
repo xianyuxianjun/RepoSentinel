@@ -144,6 +144,11 @@ export function createSubmitReviewTool(input: SubmitReviewToolContext, state: Re
  * 汇总 Agent 不能引入新事实，所以 ref 只能取自已存在的 Finding；
  * 这条不变量在工具层执行一次（给模型即时反馈），在 Agent 层再执行一次（作为可信边界）。
  */
+const MAX_MERGE_NOTE_ITEMS = 20; // 汇总补充说明的条数上限，与汇总输入的限长保持一致。
+const MAX_MERGE_NOTE_CHARS = 500; // 单条汇总补充说明的长度上限。
+// computeRecommendation 依据 limitation 前缀做确定性判定，模型提供的文本不能冒充这些内部标记。
+const INTERNAL_MARKERS = /^(agent_orchestration:|专家 Agent )/;
+
 export function validateMergePlan(value: unknown, allowedRefs: ReadonlySet<string>): MergePlan {
   if (!value || typeof value !== "object") throw new Error("Merge plan 不是对象");
   const plan = value as Record<string, unknown>; // 汇总方案的原始对象视图。
@@ -153,8 +158,15 @@ export function validateMergePlan(value: unknown, allowedRefs: ReadonlySet<strin
   for (const ref of keep) if (!allowedRefs.has(ref)) throw new Error(`Merge plan 引用了不存在的 Finding：${ref}`);
   // 有输入却被全部丢弃，通常意味着模型漏读了上下文，直接拒绝比默默清空问题列表更安全。
   if (allowedRefs.size > 0 && keep.length === 0) throw new Error("Merge plan 至少需要保留一条 Finding");
-  const strings = (item: unknown): string[] => Array.isArray(item) ? item.filter((entry): entry is string => typeof entry === "string") : [];
-  return { summary: plan.summary, keep, limitations: strings(plan.limitations), nextActions: strings(plan.nextActions) };
+  // 说明文本会被持久化到 run.json/report.md，必须和输入一样受限。
+  const notes = (item: unknown, label: string): string[] => {
+    if (!Array.isArray(item)) return [];
+    const values = item.filter((entry): entry is string => typeof entry === "string");
+    if (values.length > MAX_MERGE_NOTE_ITEMS) throw new Error(`Merge plan ${label} 不能超过 ${MAX_MERGE_NOTE_ITEMS} 条`);
+    if (values.some((entry) => entry.length > MAX_MERGE_NOTE_CHARS)) throw new Error(`Merge plan ${label} 单条不能超过 ${MAX_MERGE_NOTE_CHARS} 字`);
+    return values.map((entry) => INTERNAL_MARKERS.test(entry) ? `汇总补充：${entry}` : entry);
+  };
+  return { summary: plan.summary, keep, limitations: notes(plan.limitations, "limitations"), nextActions: notes(plan.nextActions, "nextActions") };
 }
 
 /**

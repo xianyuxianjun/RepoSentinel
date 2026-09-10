@@ -123,16 +123,17 @@ function isRecommendation(value: unknown): value is Recommendation { return ["ap
  * 这是确定性安全门：模型只能提供证据，不能自行宣布“通过”。
  */
 export function computeRecommendation(result: Omit<ReviewResult, "mergeRecommendation">, config: SentinelConfig): Recommendation {
-  if (result.limitations.some((item) => item.startsWith("agent_orchestration:"))) return "inconclusive";
   const requiredCheckIds = Object.entries(config.checks) // 所有必须成功完成的检查 ID。
     .filter(([, check]) => Boolean(check && check.enabled !== false && check.required))
     .map(([checkId]) => checkId);
   if (requiredCheckIds.some((checkId) => !result.checks.some((check) => check.checkId === checkId))) return "inconclusive";
   if (result.checks.some((check) => config.checks[check.category]?.required && (check.status === "environment_error" || check.status === "timed_out" || check.status === "skipped"))) return "inconclusive";
   if (result.checks.some((check) => check.status === "failed" && config.checks[check.category]?.required)) return "needs_changes";
+  // 先看已经拿到的确定性阻断证据：只要存在 high/critical+verified，就应该给出可操作的阻断结论。
   if (result.findings.some((finding) => (finding.severity === "critical" || finding.severity === "high") && finding.verificationStatus === "verified")) return "needs_changes";
-  // 专家没跑完就不能给出“通过”语义：否则一个专家静默失败会把阻断级问题变成 approve_with_notes。
-  // 这一条刻意放在 needs_changes 判断之后：已经拿到 high+verified 证据时，阻断结论比“无法确认”更有用。
+  // 编排不完整意味着无法给出“通过”语义，专家和汇总两个环节同等对待。
+  // 这两条刻意排在阻断证据之后：否则“汇总失败”会掩盖已经发现的 high+verified 问题。
+  if (result.limitations.some((item) => item.startsWith("agent_orchestration:"))) return "inconclusive";
   if (result.limitations.some((item) => item.startsWith("专家 Agent ") && item.includes("未完成"))) return "inconclusive";
   return result.findings.length > 0 ? "approve_with_notes" : "approve";
 }

@@ -14,10 +14,25 @@ export interface AgentDiagnosticResult {
 
 /** 诊断探针的可选参数。 */
 export interface AgentDiagnosticOptions {
-  /** 探针超时，默认 45 秒。 */
+  /** 探针超时，默认 45 秒；同时覆盖模型解析阶段。 */
   timeoutMs?: number;
   /** 配置声明的模型引用；提供时先解析，解析失败直接作为诊断结论返回。 */
   modelReference?: string;
+}
+
+/** 兼容早期的 runAgentDiagnostic(repo, timeoutMs) 调用形式，避免破坏公共 API。 */
+function normalizeOptions(options: AgentDiagnosticOptions | number): AgentDiagnosticOptions {
+  return typeof options === "number" ? { timeoutMs: options } : options;
+}
+
+/** 给不返回 Promise 边界的等待加一个上限（凭据/目录刷新可能卡住）。 */
+async function withTimeout<T>(work: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined; // 超时定时器句柄。
+  try {
+    return await Promise.race([work, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(message)), timeoutMs); })]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 /** 诊断也只保留消息摘要，避免调试命令成为敏感信息出口。 */
@@ -39,17 +54,21 @@ function summarize(message: unknown): Record<string, unknown> {
 }
 
 /** 无副作用的探针只验证 Pi Provider、Session 和 Tool Calling 是否可用。 */
-export async function runAgentDiagnostic(repositoryRoot: string, options: AgentDiagnosticOptions = {}): Promise<AgentDiagnosticResult> {
-  const timeoutMs = options.timeoutMs ?? 45_000; // 探针等待模型的超时时间。
+export async function runAgentDiagnostic(repositoryRoot: string, options: AgentDiagnosticOptions | number = {}): Promise<AgentDiagnosticResult> {
+  const settings = normalizeOptions(options); // 归一化后的探针参数。
+  const timeoutMs = settings.timeoutMs ?? 45_000; // 探针等待模型的超时时间。
   let agentModel: ResolvedReviewModel | undefined; // 诊断显式使用的模型；未配置时为 undefined。
-  if (options.modelReference) {
+  if (settings.modelReference) {
     try {
-      agentModel = await resolveReviewModel(options.modelReference);
+      // 解析阶段也会做凭据/目录刷新，必须同样受超时约束，否则 diagnose 会在这里无限等待。
+      agentModel = await withTimeout(resolveReviewModel(settings.modelReference), timeoutMs, `模型解析超过 ${timeoutMs} ms`);
     } catch (error) {
       // 模型解析失败本身就是一条诊断结论，不应该抛出去变成一次普通崩溃。
-      return { ok: false, model: options.modelReference, activeTools: [], toolCalls: 0, messageSummaries: [], error: error instanceof Error ? error.message : String(error) };
+      return { ok: false, model: settings.modelReference, activeTools: [], toolCalls: 0, messageSummaries: [], error: error instanceof Error ? error.message : String(error) };
     }
   }
+  // model 字段在所有分支上统一为 provider/modelId，避免调用方拿到两种语义。
+  const resolvedModelName = (session: { model?: { id?: string } }): string | undefined => agentModel?.reference ?? session.model?.id;
   let toolCalls = 0; // 诊断探针实际被调用的次数。
   const messageSummaries: Array<Record<string, unknown>> = []; // 只保存消息摘要，不保存正文。
   const probe = defineTool({ // 无副作用的诊断工具。
@@ -80,9 +99,9 @@ export async function runAgentDiagnostic(repositoryRoot: string, options: AgentD
     try {
       await session.prompt("Diagnostics only. Call diagnostic_probe exactly once, then reply with DONE. Do not explain before calling the tool.");
     } catch (error) {
-      return { ok: false, model: session.model?.id, activeTools: session.getActiveToolNames(), toolCalls, messageSummaries, error: error instanceof Error ? error.message : String(error) };
+      return { ok: false, model: resolvedModelName(session), activeTools: session.getActiveToolNames(), toolCalls, messageSummaries, error: error instanceof Error ? error.message : String(error) };
     }
-    return { ok: toolCalls > 0, model: session.model?.id, activeTools: session.getActiveToolNames(), toolCalls, messageSummaries, error: toolCalls > 0 ? undefined : "模型完成响应但未调用 diagnostic_probe" };
+    return { ok: toolCalls > 0, model: resolvedModelName(session), activeTools: session.getActiveToolNames(), toolCalls, messageSummaries, error: toolCalls > 0 ? undefined : "模型完成响应但未调用 diagnostic_probe" };
   } finally {
     clearTimeout(timeout);
     session.dispose();
