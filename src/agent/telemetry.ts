@@ -1,4 +1,5 @@
-import type { AgentTelemetry, ReviewTelemetry } from "../types.js";
+import type { AgentTelemetry, AnyTelemetry, ReviewTelemetry } from "../types.js";
+import { isReviewTelemetry } from "../types.js";
 
 // Provider 返回的 usage 形状可能不同，因此先把未知值归一化为安全数字。
 // 注意：usage 缺失不能等价于真实的 0 成本，usageAvailable 会保留这个区别。
@@ -23,6 +24,11 @@ function summarizeUsage(value: unknown): Record<string, number> | undefined {
 
 export function emptyTelemetry(): AgentTelemetry {
   return { usageAvailable: false, durationMs: 0, turns: 0, toolCalls: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, totalCost: 0 };
+}
+
+/** 运行级 telemetry 的零值；聚合失败时用它保留「未完成」而不是伪造质量指标。 */
+export function emptyReviewTelemetry(totalDurationMs = 0): ReviewTelemetry {
+  return { usageAvailable: false, specialistCount: 0, successfulSpecialists: 0, failedSpecialists: 0, specialistDurationMs: 0, totalDurationMs, turns: 0, toolCalls: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, totalCost: 0 };
 }
 
 export function recordUsage(telemetry: AgentTelemetry, message: unknown): void {
@@ -53,11 +59,11 @@ export function combineTelemetry(items: AgentTelemetry[]): AgentTelemetry {
   }, emptyTelemetry());
 }
 
-// 两种 telemetry 通过 specialistCount 区分；这里的类型守卫让编排器不用重复断言。 
-export function asAgentTelemetry(value: AgentTelemetry | ReviewTelemetry | undefined): AgentTelemetry | undefined {
-  return value && !("specialistCount" in value) ? value : undefined;
+// 两种 telemetry 通过共享判别函数区分；这里只做安全的向下转型，不重复实现判别逻辑。
+export function asAgentTelemetry(value: AnyTelemetry | undefined): AgentTelemetry | undefined {
+  return value !== undefined && !isReviewTelemetry(value) ? value : undefined;
 }
 
-export function asReviewTelemetry(value: AgentTelemetry | ReviewTelemetry | undefined): ReviewTelemetry | undefined {
-  return value && "specialistCount" in value ? value : undefined;
+export function asReviewTelemetry(value: AnyTelemetry | undefined): ReviewTelemetry | undefined {
+  return isReviewTelemetry(value) ? value : undefined;
 }

@@ -75,9 +75,12 @@ export interface OperatorConfig {
   aggregatorPrompt?: string;
 }
 
+/** Git 变更文件的领域状态；unknown 表示 Git 返回了未识别的状态字母。 */
+export type ChangeStatus = "added" | "deleted" | "modified" | "renamed" | "copied" | "type_changed" | "unknown";
+
 export interface GitChange {
   path: string;
-  status: string;
+  status: ChangeStatus;
   additions: number;
   deletions: number;
 }
@@ -175,6 +178,22 @@ export interface ReviewTelemetry {
   totalCost: number;
 }
 
+/** 两种 telemetry 的并集：单 Session 的 AgentTelemetry 或一次运行的 ReviewTelemetry。 */
+export type AnyTelemetry = AgentTelemetry | ReviewTelemetry;
+
+/**
+ * 用 specialistCount 结构判别运行级 telemetry。
+ * 全项目只保留这一处判别实现，避免 report / eval / lifecycle 各写一份 `in` 检查后漂移。
+ */
+export function isReviewTelemetry(value: AnyTelemetry | undefined): value is ReviewTelemetry {
+  return value !== undefined && "specialistCount" in value;
+}
+
+/** AgentTelemetry 是 ReviewTelemetry 的补集。 */
+export function isAgentTelemetry(value: AnyTelemetry | undefined): value is AgentTelemetry {
+  return value !== undefined && !("specialistCount" in value);
+}
+
 /** 一次审查的最终领域结果，也是 JSON/Markdown/SARIF 的共同输入。 */
 export interface ReviewResult {
   schemaVersion: 1;
@@ -184,7 +203,16 @@ export interface ReviewResult {
   findings: Finding[];
   limitations: string[];
   nextActions: string[];
-  telemetry?: AgentTelemetry | ReviewTelemetry;
+  telemetry?: AnyTelemetry;
+  /**
+   * 未完成结构化审查的专家角色；非空表示本次覆盖不完整。
+   *
+   * 这是「覆盖不完整」的权威信号。旧实现把 signal 编码在 limitations 的字符串前缀里
+   * （`agent_orchestration:` / `专家 Agent …未完成`），让模型可生成的文本变成了控制通道。
+   */
+  incompleteSpecialists?: string[];
+  /** 汇总/编排失败原因；存在表示本次走的是确定性降级路径。 */
+  orchestrationError?: string;
 }
 
 /** 产物目录中的运行元数据，描述输入快照、配置和最终状态。 */

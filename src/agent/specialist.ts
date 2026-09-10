@@ -41,14 +41,9 @@ export async function runReviewAgent(input: AgentRunInput): Promise<ReviewResult
     sessionManager: SessionManager.inMemory(input.repositoryRoot),
   }); // 当前专家的 Pi 会话。
   state.activeSession = session;
-  try {
-    const run = await runSession({ session, trace: input.trace, role, maxTurns: input.maxTurns ?? input.config.review.maxAgentTurns, maxSeconds: input.maxSeconds ?? input.config.review.maxSpecialistSeconds }, specialistPrompt(input), () => state.submitted); // 执行 Prompt、工具调用和生命周期限制。
-    const validated = validateReviewResult(run.submitted, checkResults, changedPaths); // 对 Agent 提交的结果做最终业务校验。
-    const telemetry = { ...run.telemetry, durationMs: run.telemetry.durationMs || 0 }; // 补齐当前专家的运行统计。
-    await input.trace.record("agent_end", { agentRole: role, findings: validated.findings.length, checks: validated.checks.length, telemetry });
-    return { ...validated, telemetry };
-  } catch (error) {
-    // 保持原有错误语义，由上层编排器决定是降级还是终止。
-    throw error;
-  }
+  const run = await runSession({ session, trace: input.trace, role, maxTurns: input.maxTurns ?? input.config.review.maxAgentTurns, maxSeconds: input.maxSeconds ?? input.config.review.maxSpecialistSeconds }, specialistPrompt(input), () => state.submitted); // 执行 Prompt、工具调用和生命周期限制。
+  const validated = validateReviewResult(run.submitted, checkResults, changedPaths); // 对 Agent 提交的结果做最终业务校验。
+  await input.trace.record("agent_end", { agentRole: role, findings: validated.findings.length, checks: validated.checks.length, telemetry: run.telemetry });
+  // 错误保持原有语义向上抛，由编排器决定是降级还是终止；这里不做无意义的 catch/rethrow。
+  return { ...validated, telemetry: run.telemetry };
 }

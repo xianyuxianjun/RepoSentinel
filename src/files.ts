@@ -72,7 +72,8 @@ export async function searchRepository(repoRoot: string, query: string, config: 
   const target = candidatePath ? (await safePath(repoRoot, candidatePath, config)).relative : "."; // 搜索目标路径，默认是整个仓库。
   const args = ["--line-number", "--no-heading", "--color", "never", "--fixed-strings", "--hidden", "--glob", "!.git/**", "--glob", "!.repo-sentinel/**"]; // rg 的固定安全参数。
   for (const pattern of effectiveDenyPathPatterns(config.commandPolicy.denyPathPatterns)) args.push("--glob", `!${pattern}`);
-  args.push(query, target);
+  // `--` 终止选项解析：否则以 "-" 开头的查询词会被 rg 当成 flag，导致工具被用来触发任意 rg 选项。
+  args.push("--", query, target);
   const result = await runProcess("rg", args, { cwd: repoRoot, timeoutMs: 30_000, maxOutputBytes: MAX_SEARCH_BYTES, env: sanitizedEnvironment() }); // 执行受控文本搜索。
   if (result.exitCode !== 0 && result.exitCode !== 1) throw new Error(`搜索失败：${result.stderr || result.stdout}`);
   return { query, path: candidatePath, output: redactSensitiveText(result.stdout), truncated: result.outputTruncated };

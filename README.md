@@ -14,12 +14,29 @@ RepoSentinel 是一个基于 Pi Agent SDK 的本地代码变更验证 Agent。�
 - 审查模型与每个 Agent 的前段提示词由**操作者配置**决定（默认 `~/.pi/agent/repo-sentinel.json`，位于被审查仓库之外），不随 PR 变更；内置默认模型为 `deepseek/deepseek-v4-flash`，解析失败会在创建 Session 前明确报错，不会静默回退到其他模型。
 - 默认使用 4 个专业 Agent 并发分工审查逻辑、测试、安全和工程质量，再由汇总 Agent 去重；汇总 Agent 只提交“保留哪些 Finding 的引用 + 摘要”，Finding 正文由主控按引用原样搬运，因此汇总阶段既不会篡改证据，也不受重新生成正文的输出量限制；角色和并行度均可配置（默认并发 4，可用 `review.maxParallelAgents` 降到 1 回到串行以兼容不支持并发流的 Provider），每个 Agent 都有独立轮次和时间上限。
 - 默认拒绝 dirty worktree、敏感路径、仓库外路径和源代码写操作。
-- 结论由确定性规则重算，模型不能自行宣布通过：必需的检查未完成、或某个专家 Agent 未完成时返回 `inconclusive`（无法完成验证）；已经拿到 `high`/`critical` 且 `verified` 的证据时优先返回 `needs_changes`，避免因为专家缺失而丢掉阻断结论。
+- 结论由确定性规则重算，模型不能自行宣布通过：必需的检查未完成、或某个专家 Agent 未完成时返回 `inconclusive`（无法完成验证）；已经拿到 `high`/`critical` 且 `verified` 的证据时优先返回 `needs_changes`，避免因为专家缺失而丢掉阻断结论。覆盖是否完整由结构化字段 `incompleteSpecialists` / `orchestrationError` 表达，`limitations` 只作为人类可读说明，不作为控制通道。
 - 输出 `run.json`、`report.md`、`report.sarif`、`checks.json` 和 `trace.jsonl`；SARIF 可被 GitHub Code Scanning 等工具消费。
 - `run.json` 和 Trace 汇总 Agent 轮次、工具调用、输入/输出 token、缓存 token、成本及时延；无法从 Provider 取得的 usage 按 0 记录并以 `usageAvailable`/`telemetryAvailableCases` 区分。
 - 敏感路径基线（`.env`、密钥/证书和 `.git`）始终拒绝访问，`denyPathPatterns` 只能追加规则，不能清空或覆盖基线。
 - 采用分层上下文：首屏只注入变更清单和限长检查摘要，Diff 通过 `get_change_context(offset, maxChars)` 分页读取；每次分块读取写入 `context_chunk_read` Trace，避免大变更一次性截断。单页上限 32,000 字符且默认用满上限，让 Agent 用尽量少的轮次读完 diff（页太小会把轮次预算耗在翻页上，而不是用于提交结论）。
+- 变更清单使用 `git diff --name-status` 的真实状态（`added`/`deleted`/`modified`/`renamed`/`copied`/`type_changed`），不再把所有文件标成 `modified`。
 - 汇总阶段同样设有输入预算：每个专家最多传入 30 条 Finding，长文本和证据摘要做限长处理，并记录 `aggregator_context_bounded` Trace。每条 Finding 在汇总输入里获得一个稳定的 `ref`（形如 `logic#2`），汇总方案只能引用这些 ref；模型引用了不存在的 ref、或把所有 Finding 都丢掉时会被工具拒绝并要求重新提交。保留决定记录在 `aggregator_merge_plan` Trace 中，可审计去重结果。
+
+## 模块结构
+
+```
+src/
+  commands.ts        预批准命令目录：命令字符串 -> 固定 file/args 的唯一来源
+  config.ts          config/ 的门面：默认值、操作者配置、仓库配置
+  review.ts          review/ 的门面：主流程 service 与生命周期 lifecycle
+  report.ts          report/ 的门面：validate / recommend / markdown / write
+  eval.ts            eval/ 的门面：types / score / run
+  agent/             Agent 编排：contracts / orchestrator / specialist / aggregator / session / prompts / telemetry
+  tools/             受控工具：context / review（submit 工具与校验）/ schema / diagnostic
+  policy.ts          路径与命令策略、脱敏、错误消息归一化
+```
+
+分层原则：`tools` 和 `agent` 只消费已校验的输入；权限、预算和确定性结论都在 service / report 层落地，模型只能提供证据。
 
 ## 安装
 
