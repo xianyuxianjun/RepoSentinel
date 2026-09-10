@@ -1,7 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
 import { mkdir } from "node:fs/promises";
 import { resolve } from "node:path";
-import { loadConfig, configHash } from "./config.js";
+import { loadConfig, configHash, DEFAULT_MODEL_REFERENCE } from "./config.js";
+import { resolveReviewModel, type ResolvedReviewModel } from "./model-runtime.js";
 import { collectGitContext } from "./git.js";
 import { executeCheck, listChecks } from "./checks.js";
 import { runMultiAgentReview } from "./agent.js";
@@ -74,12 +75,16 @@ export async function runReview(options: ReviewOptions): Promise<{ result: Revie
   };
   await trace.record("run_created", { baseSha: context.base.sha, headSha: context.head.sha, changedFiles: context.changes.length });
   let result: ReviewResult; // 最终 Review 结果，dry-run 和真实运行都会写入它。
+  let agentModel: ResolvedReviewModel | undefined; // 本次运行实际使用的模型；dry-run 或解析失败时为 undefined。
   // dry-run 仍然生成完整产物，但明确不执行检查和 Agent，避免产生虚假质量指标。
   if (options.dryRun) {
     result = { schemaVersion: 1, mergeRecommendation: "inconclusive", summary: "Dry run：已收集变更并生成检查计划，未调用 Agent 或执行检查。", checks: listChecks(config).map(({ checkId, config: check }) => ({ checkId, category: checkId, commandId: checkId, displayCommand: check.command, status: "skipped" as const, startedAt: new Date().toISOString(), finishedAt: new Date().toISOString(), durationMs: 0, output: "", outputTruncated: false })), findings: [], limitations: ["dry-run 未执行检查"], nextActions: ["移除 --dry-run 以运行实际审查"] };
   } else {
     let executedChecks: CheckResult[] = []; // 主控已经执行过的检查结果。
     try {
+      // 模型先于检查和 Session 解析：配置或认证有问题时应该立刻失败，而不是让每个专家各自报错。
+      agentModel = await resolveReviewModel(config.review.model ?? DEFAULT_MODEL_REFERENCE);
+      await trace.record("agent_model_resolved", { model: agentModel.reference, thinkingLevel: agentModel.thinkingLevel, requested: config.review.model ?? null });
       // 主控统一执行检查，专家只消费结果，避免多个 Agent 重复运行 npm 命令。
       const enabledChecks = listChecks(config); // 当前配置中启用的检查列表。
       executedChecks = await executeChecksOnce(repositoryRoot, config, enabledChecks.map(({ checkId }) => checkId));
@@ -95,6 +100,7 @@ export async function runReview(options: ReviewOptions): Promise<{ result: Revie
         maxParallelAgents: config.review.maxParallelAgents,
         specialistSeconds: config.review.maxSpecialistSeconds,
         aggregatorSeconds: config.review.maxAggregatorSeconds,
+        agentModel,
       });
       result = { ...result, mergeRecommendation: computeRecommendation(result, config) };
     } catch (error) {
@@ -119,6 +125,8 @@ export async function runReview(options: ReviewOptions): Promise<{ result: Revie
   };
   metadata.status = result.mergeRecommendation === "inconclusive" ? "failed" : "completed";
   metadata.finishedAt = new Date().toISOString();
+  // 把实际使用的模型写进 run.json，事后才能解释这份报告是哪个模型给出的。
+  if (agentModel) metadata.agent = { provider: agentModel.model.provider, model: agentModel.model.id, thinkingLevel: agentModel.thinkingLevel };
   await writeRun(outputDir, metadata, result, context);
   await trace.record("run_finished", { status: metadata.status, recommendation: result.mergeRecommendation });
   return { result, metadata, outputDir };

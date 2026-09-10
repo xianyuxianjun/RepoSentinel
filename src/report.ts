@@ -131,7 +131,9 @@ export function computeRecommendation(result: Omit<ReviewResult, "mergeRecommend
   if (result.checks.some((check) => config.checks[check.category]?.required && (check.status === "environment_error" || check.status === "timed_out" || check.status === "skipped"))) return "inconclusive";
   if (result.checks.some((check) => check.status === "failed" && config.checks[check.category]?.required)) return "needs_changes";
   if (result.findings.some((finding) => (finding.severity === "critical" || finding.severity === "high") && finding.verificationStatus === "verified")) return "needs_changes";
-  if (result.limitations.some((item) => item.startsWith("专家 Agent ") && item.includes("未完成"))) return "approve_with_notes";
+  // 专家没跑完就不能给出“通过”语义：否则一个专家静默失败会把阻断级问题变成 approve_with_notes。
+  // 这一条刻意放在 needs_changes 判断之后：已经拿到 high+verified 证据时，阻断结论比“无法确认”更有用。
+  if (result.limitations.some((item) => item.startsWith("专家 Agent ") && item.includes("未完成"))) return "inconclusive";
   return result.findings.length > 0 ? "approve_with_notes" : "approve";
 }
 

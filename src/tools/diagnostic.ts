@@ -1,5 +1,6 @@
 import { createAgentSession, defineTool, SessionManager } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { resolveReviewModel, type ResolvedReviewModel } from "../model-runtime.js";
 
 /** 诊断命令的窄结果模型，只报告 Session 是否能完成最小工具调用。 */
 export interface AgentDiagnosticResult {
@@ -9,6 +10,14 @@ export interface AgentDiagnosticResult {
   toolCalls: number;
   messageSummaries: Array<Record<string, unknown>>;
   error?: string;
+}
+
+/** 诊断探针的可选参数。 */
+export interface AgentDiagnosticOptions {
+  /** 探针超时，默认 45 秒。 */
+  timeoutMs?: number;
+  /** 配置声明的模型引用；提供时先解析，解析失败直接作为诊断结论返回。 */
+  modelReference?: string;
 }
 
 /** 诊断也只保留消息摘要，避免调试命令成为敏感信息出口。 */
@@ -30,7 +39,17 @@ function summarize(message: unknown): Record<string, unknown> {
 }
 
 /** 无副作用的探针只验证 Pi Provider、Session 和 Tool Calling 是否可用。 */
-export async function runAgentDiagnostic(repositoryRoot: string, timeoutMs = 45_000): Promise<AgentDiagnosticResult> {
+export async function runAgentDiagnostic(repositoryRoot: string, options: AgentDiagnosticOptions = {}): Promise<AgentDiagnosticResult> {
+  const timeoutMs = options.timeoutMs ?? 45_000; // 探针等待模型的超时时间。
+  let agentModel: ResolvedReviewModel | undefined; // 诊断显式使用的模型；未配置时为 undefined。
+  if (options.modelReference) {
+    try {
+      agentModel = await resolveReviewModel(options.modelReference);
+    } catch (error) {
+      // 模型解析失败本身就是一条诊断结论，不应该抛出去变成一次普通崩溃。
+      return { ok: false, model: options.modelReference, activeTools: [], toolCalls: 0, messageSummaries: [], error: error instanceof Error ? error.message : String(error) };
+    }
+  }
   let toolCalls = 0; // 诊断探针实际被调用的次数。
   const messageSummaries: Array<Record<string, unknown>> = []; // 只保存消息摘要，不保存正文。
   const probe = defineTool({ // 无副作用的诊断工具。
@@ -46,6 +65,9 @@ export async function runAgentDiagnostic(repositoryRoot: string, timeoutMs = 45_
   });
   const { session } = await createAgentSession({ // 创建用于连通性诊断的 Pi Session。
     cwd: repositoryRoot,
+    thinkingLevel: agentModel?.thinkingLevel,
+    model: agentModel?.model,
+    modelRuntime: agentModel?.modelRuntime,
     tools: ["diagnostic_probe"],
     customTools: [probe],
     sessionManager: SessionManager.inMemory(repositoryRoot),

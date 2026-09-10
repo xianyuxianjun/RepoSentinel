@@ -34,6 +34,8 @@ export interface SessionRunOptions {
   role: string;
   maxTurns: number;
   maxSeconds: number;
+  /** 期望 Agent 调用的提交工具名，仅用于未提交时的错误描述。 */
+  submitToolName?: string;
 }
 
 export interface SessionRunResult {
@@ -86,7 +88,7 @@ export async function runSession(options: SessionRunOptions, prompt: string, get
     } catch (error) {
       if (getSubmitted() === undefined) throw (limitReached ? new Error(`Agent ${options.role} 超过限制：${turnCount} 轮或 ${options.maxSeconds} 秒`) : error);
     }
-    if (getSubmitted() === undefined) throw new Error(`${options.role === "aggregator" ? "汇总 Agent" : `Agent ${options.role}`} 未调用 submit_review`);
+    if (getSubmitted() === undefined) throw new Error(`${options.role === "aggregator" ? "汇总 Agent" : `Agent ${options.role}`} 未调用 ${options.submitToolName ?? "submit_review"}`);
     telemetry.durationMs = Date.now() - startedAt;
     return { telemetry, submitted: getSubmitted() };
   } finally {

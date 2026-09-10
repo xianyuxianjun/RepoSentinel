@@ -1,6 +1,7 @@
 // index.ts 是公共 API 门面：外部调用方从这里导入，不需要了解内部文件组织。
 export * from "./types.js";
 export * from "./config.js";
+export * from "./model-runtime.js";
 export * from "./git.js";
 export * from "./policy.js";
 export * from "./checks.js";

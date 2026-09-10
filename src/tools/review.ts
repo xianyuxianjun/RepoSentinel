@@ -1,12 +1,12 @@
 import { defineTool } from "@earendil-works/pi-coding-agent";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import type { CheckResult, GitContext, ReviewResult, SentinelConfig } from "../types.js";
+import type { CheckResult, GitContext, MergePlan, ReviewResult, SentinelConfig } from "../types.js";
 import { executeCheck, listChecks } from "../checks.js";
 import { validateReviewResult } from "../report.js";
 import { MAX_READ_LINE_NUMBER, readRepositoryFile, searchRepository } from "../files.js";
 import { getContextChunk } from "./context.js";
-import { reviewResultSchema } from "./schema.js";
+import { mergePlanSchema, reviewResultSchema } from "./schema.js";
 import { TraceRecorder } from "../trace.js";
 
 /**
@@ -33,7 +33,14 @@ export interface SubmitReviewToolContext {
   role: string;
   checkResults: CheckResult[];
   changedPaths: string[];
-  merged: boolean;
+}
+
+/** 汇总工具只需要 Trace 和本次汇总允许引用的 Finding 集合。 */
+export interface SubmitMergePlanToolContext {
+  trace: TraceRecorder;
+  role: string;
+  /** 汇总输入里真实存在的 Finding 引用；模型不能引用集合之外的 ref。 */
+  allowedRefs: ReadonlySet<string>;
 }
 
 /** 把 SDK 工具的共性配置集中在工具层，Agent 层只决定何时装配它们。 */
@@ -97,7 +104,7 @@ export function createSpecialistTools(input: ReviewToolContext, state: ReviewToo
       return { content: [{ type: "text", text: JSON.stringify(result) }], details: {} };
     },
   });
-  const submitReview = createSubmitReviewTool({ trace: input.trace, role: input.role, checkResults: input.checkResults, changedPaths: input.changedPaths, merged: false }, state); // 创建最终结果提交工具。
+  const submitReview = createSubmitReviewTool({ trace: input.trace, role: input.role, checkResults: input.checkResults, changedPaths: input.changedPaths }, state); // 创建最终结果提交工具。
 
   const tools: ToolDefinition[] = []; // 当前专家最终拥有的工具定义。
   if (options.includeContextTools !== false) {
@@ -110,14 +117,14 @@ export function createSpecialistTools(input: ReviewToolContext, state: ReviewToo
   return toolBundle(...tools);
 }
 
-/** submit_review 是 Agent 到确定性业务层的唯一交界点，所有结果必须在工具层校验。 */
+/** submit_review 是专家 Agent 到确定性业务层的交界点，所有结果必须在工具层校验。 */
 export function createSubmitReviewTool(input: SubmitReviewToolContext, state: ReviewToolState): ToolDefinition {
   return defineTool({
-    name: "submit_review", label: "Submit Review", description: input.merged ? "Submit the merged structured review result." : "Submit the final structured review result.",
-    promptSnippet: input.merged ? "Submit the merged structured review; if validation fails, correct it and submit again." : "Submit the structured review; if validation fails, correct it and submit again.",
+    name: "submit_review", label: "Submit Review", description: "Submit the final structured review result.",
+    promptSnippet: "Submit the structured review; if validation fails, correct it and submit again.",
     parameters: Type.Object({ result: reviewResultSchema }),
     execute: async (_id, params) => {
-      if (state.submitted !== undefined) throw new Error(`${input.merged ? "Merged review" : "Review"} 已经提交，不允许重复提交`); // 一个 Session 只允许提交一次。
+      if (state.submitted !== undefined) throw new Error("Review 已经提交，不允许重复提交"); // 一个 Session 只允许提交一次。
       try {
         validateReviewResult(params.result, input.checkResults, input.changedPaths);
       } catch (error) {
@@ -126,7 +133,53 @@ export function createSubmitReviewTool(input: SubmitReviewToolContext, state: Re
       }
       state.submitted = params.result; // 保存已校验的结构化结果。
       void state.activeSession?.abort(); // 提交成功后立即停止模型继续生成。
-      return { content: [{ type: "text", text: input.merged ? "Merged review submitted for validation." : "Review submitted for validation." }], details: {} };
+      return { content: [{ type: "text", text: "Review submitted for validation." }], details: {} };
+    },
+  });
+}
+
+/**
+ * 校验汇总方案。
+ *
+ * 汇总 Agent 不能引入新事实，所以 ref 只能取自已存在的 Finding；
+ * 这条不变量在工具层执行一次（给模型即时反馈），在 Agent 层再执行一次（作为可信边界）。
+ */
+export function validateMergePlan(value: unknown, allowedRefs: ReadonlySet<string>): MergePlan {
+  if (!value || typeof value !== "object") throw new Error("Merge plan 不是对象");
+  const plan = value as Record<string, unknown>; // 汇总方案的原始对象视图。
+  if (typeof plan.summary !== "string" || plan.summary.trim() === "" || plan.summary.length > 500) throw new Error("Merge plan summary 必须是 1 到 500 字");
+  if (!Array.isArray(plan.keep) || plan.keep.some((item) => typeof item !== "string")) throw new Error("Merge plan keep 必须是字符串数组");
+  const keep = [...new Set(plan.keep as string[])]; // 去重后的保留列表，顺序保持模型给出的先后。
+  for (const ref of keep) if (!allowedRefs.has(ref)) throw new Error(`Merge plan 引用了不存在的 Finding：${ref}`);
+  // 有输入却被全部丢弃，通常意味着模型漏读了上下文，直接拒绝比默默清空问题列表更安全。
+  if (allowedRefs.size > 0 && keep.length === 0) throw new Error("Merge plan 至少需要保留一条 Finding");
+  const strings = (item: unknown): string[] => Array.isArray(item) ? item.filter((entry): entry is string => typeof entry === "string") : [];
+  return { summary: plan.summary, keep, limitations: strings(plan.limitations), nextActions: strings(plan.nextActions) };
+}
+
+/**
+ * submit_merge_plan 是汇总 Agent 到确定性合并层的交界点。
+ *
+ * 它只接受“保留哪些 ref”和摘要，正文由 assembleMergedResult 按 ref 搬运，
+ * 因此汇总阶段不再受生成全部 Finding 正文的输出量限制。
+ */
+export function createSubmitMergePlanTool(input: SubmitMergePlanToolContext, state: ReviewToolState): ToolDefinition {
+  return defineTool({
+    name: "submit_merge_plan", label: "Submit Merge Plan",
+    description: "Submit the deduplication decision: which specialist finding refs to keep, plus the merged summary, limitations and next actions.",
+    promptSnippet: "Submit the merge plan (keep refs + summary); if validation fails, correct it and submit again.",
+    parameters: Type.Object({ plan: mergePlanSchema }),
+    execute: async (_id, params) => {
+      if (state.submitted !== undefined) throw new Error("Merge plan 已经提交，不允许重复提交");
+      try {
+        validateMergePlan(params.plan, input.allowedRefs);
+      } catch (error) {
+        await input.trace.record("agent_submit_rejected", { agentRole: input.role, error: error instanceof Error ? error.message : String(error) });
+        throw error;
+      }
+      state.submitted = params.plan; // 保存已校验的汇总方案。
+      void state.activeSession?.abort(); // 提交成功后立即停止模型继续生成。
+      return { content: [{ type: "text", text: "Merge plan submitted for validation." }], details: {} };
     },
   });
 }

@@ -29,7 +29,16 @@ export async function runReviewAgent(input: AgentRunInput): Promise<ReviewResult
 
   const sessionFactory = input.createAgentSession ?? createAgentSession; // 生产环境或测试环境使用的 Session 创建函数。
   // SessionManager 使用内存实现，避免本地审查把对话持久化到不必要的位置。
-  const { session } = await sessionFactory({ cwd: input.repositoryRoot, thinkingLevel: "low", tools: toolNames, customTools, sessionManager: SessionManager.inMemory(input.repositoryRoot) }); // 当前专家的 Pi 会话。
+  // model/modelRuntime 只在配置里显式声明了模型时才传入，未声明时保持 Pi 默认行为。
+  const { session } = await sessionFactory({
+    cwd: input.repositoryRoot,
+    thinkingLevel: input.agentModel?.thinkingLevel ?? "low",
+    model: input.agentModel?.model,
+    modelRuntime: input.agentModel?.modelRuntime,
+    tools: toolNames,
+    customTools,
+    sessionManager: SessionManager.inMemory(input.repositoryRoot),
+  }); // 当前专家的 Pi 会话。
   state.activeSession = session;
   try {
     const run = await runSession({ session, trace: input.trace, role, maxTurns: input.maxTurns ?? 12, maxSeconds: input.maxSeconds ?? 300 }, specialistPrompt(input), () => state.submitted); // 执行 Prompt、工具调用和生命周期限制。

@@ -29,11 +29,26 @@ ${JSON.stringify(input.context.changes)}
 允许定位的变更文件路径：${JSON.stringify(changedPaths)}`;
 }
 
-/** 构造汇总 Prompt；payload 已在 aggregator.ts 中裁剪，这里不再接收完整专家对象。 */
+/**
+ * 构造汇总 Prompt。
+ *
+ * payload 已在 aggregator.ts 中裁剪并编好 ref，这里只描述“怎么去重”，
+ * 明确要求模型不要重写 Finding 正文：正文由主控按 ref 原样搬运。
+ */
 export function aggregatorPrompt(payload: unknown, failedRoles: string[]): string {
-  return `你是 RepoSentinel 的汇总 Agent。请合并多个专家 Agent 的结构化审查结果，去除同一根因的重复 Finding，保留证据最充分、位置最准确的一条。不要新增没有出现在专家结果中的事实。${failedRoles.length ? `以下专家未完成：${failedRoles.join(", ")}。` : ""}
+  return `你是 RepoSentinel 的汇总 Agent。你的任务是去重，不是重写。
 
-检查结果已经由主控程序统一执行，不能修改 checks。最终必须调用 submit_review，输出 summary、findings、limitations、nextActions。evidence.type 只能是 command、diff 或 source；location.path 必须是本次变更文件路径。高等级 Finding 必须保留 evidence，无法确认的结论标记 needs_human_review。若 submit_review 返回校验错误，请根据错误修正后重新提交。
+汇总输入里的每条 Finding 都带一个 ref（形如 logic#2）。判断哪些 Finding 描述同一个根因，只保留证据最充分、位置最准确的一条，把保留项的 ref 放进 keep。${failedRoles.length ? `
+以下专家未完成，不要为它们补写结论：${failedRoles.join(", ")}。` : ""}
 
-专家结果：${JSON.stringify(payload)}`;
+规则：
+- keep 只能填写汇总输入中出现过的 ref，不能新增、不能编造 Finding。不要参考 Finding 原 id。
+- 不要重复 Listing 正文、证据或严重等级：保留项的正文由主控按 ref 原样搬运，你写的正文会被忽略。
+- 至少保留一条 Finding；确实全部重复时才允许减少到一条。
+- summary 不超过 500 字，只写合并后的结论；limitations 和 nextActions 只补充专家结果里没有明确的全局信息，不要复述。
+- 不要新增没有出现在专家结果中的事实。检查结果由主控统一执行，不能修改 checks。
+
+最终必须调用 submit_merge_plan 提交 summary、keep、limitations、nextActions。若返回校验错误，请根据错误修正后重新提交。
+
+汇总输入：${JSON.stringify(payload)}`;
 }

@@ -43,6 +43,8 @@ export interface SentinelConfig {
     maxParallelAgents: number;
     maxSpecialistSeconds: number;
     maxAggregatorSeconds: number;
+    /** 模型引用，如 "deepseek/deepseek-v4-pro"，可带 ":high" 思考档位；缺省时使用内置默认模型。 */
+    model?: string;
     roles: AgentRoleConfig[];
   };
 }
@@ -106,6 +108,21 @@ export interface Finding {
   confidence: number;
   suggestedFix: string;
   verificationStatus: VerificationStatus;
+}
+
+/**
+ * 汇总 Agent 提交的去重方案。
+ *
+ * 汇总阶段只决定“保留哪些专家 Finding”并写摘要，不重新生成 Finding 正文。
+ * 这样模型输出从数万 token 降到数百 token，也避免转述证据时引入偏差。
+ */
+export interface MergePlan {
+  /** 合并后的结论摘要，上限与单一 ReviewResult.summary 一致。 */
+  summary: string;
+  /** 需要保留的 Finding 引用，取值来自汇总输入中的 ref 字段。 */
+  keep: string[];
+  limitations: string[];
+  nextActions: string[];
 }
 
 /** 单个 Agent Session 的运行统计；usageAvailable 区分未知和真实零值。 */

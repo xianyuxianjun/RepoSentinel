@@ -1,0 +1,79 @@
+{
+  "version": 1,
+  "checks": {
+    "test": {
+      "command": "npm test",
+      "required": true,
+      "timeoutSeconds": 120
+    },
+    "lint": {
+      "command": "npm run lint",
+      "required": false,
+      "timeoutSeconds": 120
+    },
+    "typecheck": {
+      "command": "npm run typecheck",
+      "required": false,
+      "timeoutSeconds": 120
+    },
+    "dependency": {
+      "command": "npm audit --json",
+      "required": false,
+      "timeoutSeconds": 120
+    },
+    "build": {
+      "command": "npm run build",
+      "required": false,
+      "timeoutSeconds": 120
+    }
+  },
+  "commandPolicy": {
+    "allowed": [
+      "npm test",
+      "npm run lint",
+      "npm run typecheck",
+      "npm audit --json",
+      "npm run build"
+    ],
+    "denyPathPatterns": [
+      ".env",
+      ".env.*",
+      "**/*.pem",
+      "**/*.key",
+      ".git/**"
+    ],
+    "maxOutputBytes": 200000
+  },
+  "review": {
+    "maxChangedFiles": 80,
+    "maxDiffBytes": 500000,
+    "maxAgentTurns": 12,
+    "maxAgentSeconds": 600,
+    "maxParallelAgents": 4,
+    "maxSpecialistSeconds": 300,
+    "maxAggregatorSeconds": 180,
+    "model": "deepseek/deepseek-v4-pro",
+    "roles": [
+      {
+        "id": "logic",
+        "instructions": "重点检查业务逻辑、边界条件、状态变化和潜在回归。",
+        "enabled": true
+      },
+      {
+        "id": "testing",
+        "instructions": "重点检查测试覆盖、类型安全、构建配置和检查失败是否揭示真实问题。",
+        "enabled": true
+      },
+      {
+        "id": "security",
+        "instructions": "重点检查敏感数据、权限边界、依赖和输入处理风险。",
+        "enabled": true
+      },
+      {
+        "id": "quality",
+        "instructions": "重点检查可维护性、性能、API 设计和工程一致性。",
+        "enabled": true
+      }
+    ]
+  }
+}

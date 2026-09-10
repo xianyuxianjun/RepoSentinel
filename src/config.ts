@@ -13,6 +13,13 @@ const defaultRoles: AgentRoleConfig[] = [
   { id: "quality", instructions: "重点检查可维护性、性能、API 设计和工程一致性。", enabled: true },
 ];
 
+/**
+ * 未显式配置 review.model 时使用的模型引用。
+ * 默认落在具体模型上，是为了让审查成本和行为可预期，而不是跟随 Pi 全局默认模型漂移。
+ */
+export const DEFAULT_MODEL_REFERENCE = "deepseek/deepseek-v4-pro";
+
+const MAX_MODEL_REFERENCE_LENGTH = 200; // 模型引用长度上限，防止异常配置进入 Trace 和报告。
 const MAX_CHANGED_FILES = 1_000; // 单次审查允许的最大变更文件数。
 const MAX_DIFF_BYTES = 5_000_000; // 单次审查允许读取的最大 Diff 字节数。
 const MAX_OUTPUT_BYTES = 5_000_000; // 单次检查允许保存的最大输出字节数。
@@ -39,12 +46,16 @@ export const DEFAULT_CONFIG: SentinelConfig = {
     maxChangedFiles: 80,
     maxDiffBytes: 500_000,
     maxAgentTurns: 12,
-    maxAgentSeconds: 300,
-    // Conservative default: some Pi providers serialize streaming requests.
-    // Users with a provider that supports concurrent streams can raise this to 2-4.
-    maxParallelAgents: 1,
-    maxSpecialistSeconds: 90,
-    maxAggregatorSeconds: 90,
+    maxAgentSeconds: 600,
+    // 默认按“推理模型 + 长 Prompt”标定：实测 deepseek-v4-pro 单个专家约 60-95 秒，
+    // 最重的 testing 角色（10-13 次工具调用）在并发争用下会超过 180 秒，因此专家上限留到 300 秒；
+    // 汇总阶段只提交去重方案和摘要，输出量小，180 秒足够。
+    // 4 个专家默认并发：实测串行 246s → 并发 ~88s，且专家之间没有共享可变状态。
+    // Provider 不支持并发流或有限流时，把这里降到 1 即可回到串行执行。
+    maxParallelAgents: 4,
+    maxSpecialistSeconds: 300,
+    maxAggregatorSeconds: 180,
+    model: DEFAULT_MODEL_REFERENCE,
     roles: defaultRoles,
   },
 };
@@ -100,6 +111,10 @@ export function validateConfig(input: unknown): SentinelConfig {
   const maxParallelAgents = typeof review.maxParallelAgents === "number" ? review.maxParallelAgents : DEFAULT_CONFIG.review.maxParallelAgents;
   const maxSpecialistSeconds = typeof review.maxSpecialistSeconds === "number" ? review.maxSpecialistSeconds : typeof review.maxAgentSeconds === "number" ? review.maxAgentSeconds : DEFAULT_CONFIG.review.maxSpecialistSeconds;
   const maxAggregatorSeconds = typeof review.maxAggregatorSeconds === "number" ? review.maxAggregatorSeconds : typeof review.maxAgentSeconds === "number" ? review.maxAgentSeconds : DEFAULT_CONFIG.review.maxAggregatorSeconds;
+  // 模型引用会直接进入 SDK 解析和 Trace，因此限制长度并拒绝控制字符。
+  const rawModel = review.model ?? DEFAULT_CONFIG.review.model; // 用户配置或内置默认的模型引用。
+  if (typeof rawModel !== "string" || rawModel.trim() === "" || rawModel.length > MAX_MODEL_REFERENCE_LENGTH || /[\u0000-\u001f\u007f]/.test(rawModel)) throw new Error(`review.model 必须为 1 到 ${MAX_MODEL_REFERENCE_LENGTH} 字的模型引用，例如 ${DEFAULT_MODEL_REFERENCE}`);
+  const model = rawModel.trim(); // 归一化后的模型引用。
   const rawRoles = review.roles ?? DEFAULT_CONFIG.review.roles; // 用户配置或默认的专家角色列表。
   if (!Array.isArray(rawRoles) || rawRoles.length < 1 || rawRoles.length > 8) throw new Error("review.roles 必须包含 1 到 8 个角色");
   const roleIds = new Set<string>(); // 用于检测重复角色 ID。
@@ -131,7 +146,7 @@ export function validateConfig(input: unknown): SentinelConfig {
       denyPathPatterns: effectiveDenyPathPatterns(Array.isArray(policy.denyPathPatterns) ? policy.denyPathPatterns.filter((item): item is string => typeof item === "string") : []),
       maxOutputBytes,
     },
-    review: { maxChangedFiles, maxDiffBytes, maxAgentTurns, maxAgentSeconds, maxParallelAgents, maxSpecialistSeconds, maxAggregatorSeconds, roles },
+    review: { maxChangedFiles, maxDiffBytes, maxAgentTurns, maxAgentSeconds, maxParallelAgents, maxSpecialistSeconds, maxAggregatorSeconds, model, roles },
   };
 }
 

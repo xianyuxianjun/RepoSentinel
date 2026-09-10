@@ -1,29 +1,57 @@
 import { createAgentSession, SessionManager } from "@earendil-works/pi-coding-agent";
-import type { ReviewResult } from "../types.js";
+import type { CheckResult, Finding, MergePlan, ReviewResult } from "../types.js";
 import { validateReviewResult } from "../report.js";
 import { runSession } from "./session.js";
 import { boundedPreview } from "../tools/context.js";
 import { aggregatorPrompt } from "./prompts.js";
 import type { MultiAgentRunInput, SpecialistResult } from "./contracts.js";
-import { createSubmitReviewTool, type ReviewToolState } from "../tools/review.js";
+import { createSubmitMergePlanTool, validateMergePlan, type ReviewToolState } from "../tools/review.js";
 
 // 汇总输入是多个专家结果的总和，必须单独设置预算，不能沿用单个 Diff 的预算。
 export const MAX_AGGREGATOR_CONTEXT_CHARS = 40_000;
+
+/** 汇总输入里的一条 Finding：去掉各专家自己的 id，改用全局唯一的 ref。 */
+interface AggregatorFinding extends Omit<Finding, "id"> {
+  ref: string;
+}
+
+/** 单个专家在汇总输入中的投影。 */
+interface AggregatorPayloadItem {
+  role: string;
+  summary: string;
+  findings: AggregatorFinding[];
+  limitations: string[];
+  nextActions: string[];
+}
+
+/**
+ * 不同专家各自从 finding_1 开始编号，直接沿用会让模型无法准确表达“保留哪一条”。
+ * ref 形如 `logic#2`，只用于汇总阶段，不进入最终报告。
+ */
+function findingRef(role: string, index: number): string {
+  return `${role}#${index + 1}`;
+}
 
 /**
  * 为汇总 Agent 构造最小必要信息。
  * 每层都有限制：专家数量、Finding 数量、文本长度和总字符数。
  */
-function buildAggregatorPayload(successes: SpecialistResult[]): { payload: Array<Record<string, unknown>>; payloadChars: number; truncatedFindings: number } {
-  const payload = successes.map(({ role, result }) => ({
+export function buildAggregatorPayload(successes: SpecialistResult[]): { payload: AggregatorPayloadItem[]; payloadChars: number; truncatedFindings: number; refs: Set<string> } {
+  const payload: AggregatorPayloadItem[] = successes.map(({ role, result }) => ({
     role,
     summary: boundedPreview(result.summary, 1_000),
-    findings: result.findings.slice(0, 30).map((finding) => ({
-      ...finding,
+    // 只投影汇总需要的字段，并剔除原 id，避免模型混用 id 和 ref。
+    findings: result.findings.slice(0, 30).map((finding, index) => ({
+      ref: findingRef(role, index),
+      severity: finding.severity,
+      category: finding.category,
       title: boundedPreview(finding.title, 240),
       summary: boundedPreview(finding.summary, 1_000),
-      suggestedFix: boundedPreview(finding.suggestedFix, 800),
+      location: finding.location,
       evidence: finding.evidence.slice(0, 5).map((evidence) => ({ ...evidence, summary: boundedPreview(evidence.summary, 600) })),
+      confidence: finding.confidence,
+      suggestedFix: boundedPreview(finding.suggestedFix, 800),
+      verificationStatus: finding.verificationStatus,
     })),
     limitations: result.limitations.slice(0, 20).map((item) => boundedPreview(item, 500)),
     nextActions: result.nextActions.slice(0, 20).map((item) => boundedPreview(item, 500)),
@@ -31,26 +59,70 @@ function buildAggregatorPayload(successes: SpecialistResult[]): { payload: Array
   let payloadChars = JSON.stringify(payload).length; // 汇总输入当前占用的字符数。
   let truncatedFindings = 0; // 因超出预算而删除的 Finding 数量。
   // 超预算时优先删除 Finding，而不是删除角色和限制信息；这样仍能保留失败语义。
-  while (payloadChars > MAX_AGGREGATOR_CONTEXT_CHARS && payload.some((item) => Array.isArray(item.findings) && item.findings.length > 0)) {
-    const target = payload.reduce((current, item) => (item.findings as unknown[]).length > (current.findings as unknown[]).length ? item : current); // 找出 Finding 最多的专家，优先从它裁剪。
-    (target.findings as unknown[]).pop();
+  while (payloadChars > MAX_AGGREGATOR_CONTEXT_CHARS && payload.some((item) => item.findings.length > 0)) {
+    const target = payload.reduce((current, item) => item.findings.length > current.findings.length ? item : current); // 找出 Finding 最多的专家，优先从它裁剪。
+    target.findings.pop();
     truncatedFindings += 1;
     payloadChars = JSON.stringify(payload).length;
   }
-  return { payload, payloadChars, truncatedFindings };
+  // ref 集合在裁剪之后统计，保证模型能引用的 ref 和它看到的输入完全一致。
+  const refs = new Set(payload.flatMap((item) => item.findings.map((finding) => finding.ref)));
+  return { payload, payloadChars, truncatedFindings, refs };
 }
 
-/** 汇总专家结果；汇总 Agent 只能提交结果，不能重新读取仓库或执行检查。 */
+/**
+ * 按汇总方案组装最终结果。
+ *
+ * Finding 正文一律从专家原始结果搬运，模型只提供 keep 列表和摘要，
+ * 因此汇总阶段既不会改写证据，也不需要重新生成数万 token 的正文。
+ */
+export function assembleMergedResult(payload: AggregatorPayloadItem[], plan: MergePlan, checks: CheckResult[]): ReviewResult {
+  const keep = new Set(plan.keep); // 模型决定保留的 Finding 引用。
+  const findings: Finding[] = []; // 按汇总输入顺序组装的最终 Finding 列表。
+  // 按输入顺序而不是 keep 顺序输出，保证同一份专家结果在不同运行里顺序稳定。
+  for (const item of payload) {
+    for (const finding of item.findings) {
+      if (!keep.has(finding.ref)) continue;
+      const { ref: _ref, ...rest } = finding; // ref 只用于汇总阶段，不进入最终报告。
+      findings.push({ ...rest, id: `finding_${findings.length + 1}` });
+    }
+  }
+  return {
+    schemaVersion: 1,
+    mergeRecommendation: "inconclusive", // 占位值，由 computeRecommendation 在编排层重新计算。
+    summary: plan.summary,
+    checks,
+    findings,
+    limitations: plan.limitations,
+    nextActions: plan.nextActions,
+  };
+}
+
+/** 汇总专家结果；汇总 Agent 只提交去重方案，不能重新读取仓库或执行检查。 */
 export async function runAggregatorAgent(input: MultiAgentRunInput, successes: SpecialistResult[], failedRoles: string[]): Promise<ReviewResult> {
   const state: ReviewToolState = { submitted: undefined }; // 汇总 Tool 与 Session 共享的提交状态。
-  const submitReview = createSubmitReviewTool({ trace: input.trace, role: "aggregator", checkResults: input.initialChecks ?? [], changedPaths: input.context.changes.map((change) => change.path), merged: true }, state); // 创建只允许提交结果的汇总工具。
-  const sessionFactory = input.createAgentSession ?? createAgentSession; // 生产或测试用的 Session 创建函数。
-  const { session } = await sessionFactory({ cwd: input.repositoryRoot, thinkingLevel: "low", tools: ["submit_review"], customTools: [submitReview], sessionManager: SessionManager.inMemory(input.repositoryRoot) }); // 汇总 Agent 的 Pi 会话。
-  state.activeSession = session; // 让 submit_review 成功后可以主动终止会话。
+  // 先准备有界输入：工具需要合法的 ref 集合，而 ref 由输入裁剪后的结果决定。
   const prepared = buildAggregatorPayload(successes); // 裁剪专家结果，生成有界的汇总输入。
-  await input.trace.record("aggregator_context_bounded", { agentRole: "aggregator", specialistCount: prepared.payload.length, payloadChars: prepared.payloadChars, maxContextChars: MAX_AGGREGATOR_CONTEXT_CHARS, maxFindingsPerSpecialist: 30, truncatedFindings: prepared.truncatedFindings });
-  const run = await runSession({ session, trace: input.trace, role: "aggregator", maxTurns: input.maxTurns ?? 12, maxSeconds: input.aggregatorSeconds ?? input.maxSeconds ?? 90 }, aggregatorPrompt(prepared.payload, failedRoles), () => state.submitted); // 执行汇总 Prompt 和提交工具。
-  const validated = validateReviewResult(run.submitted, input.initialChecks ?? [], input.context.changes.map((change) => change.path)); // 校验汇总后的最终结果。
+  const submitPlan = createSubmitMergePlanTool({ trace: input.trace, role: "aggregator", allowedRefs: prepared.refs }, state); // 创建只允许提交去重方案的工具。
+  const sessionFactory = input.createAgentSession ?? createAgentSession; // 生产或测试用的 Session 创建函数。
+  // 汇总 Agent 与专家使用同一个已解析模型，避免同一份报告里混用不同模型。
+  const { session } = await sessionFactory({
+    cwd: input.repositoryRoot,
+    thinkingLevel: input.agentModel?.thinkingLevel ?? "low",
+    model: input.agentModel?.model,
+    modelRuntime: input.agentModel?.modelRuntime,
+    tools: ["submit_merge_plan"],
+    customTools: [submitPlan],
+    sessionManager: SessionManager.inMemory(input.repositoryRoot),
+  }); // 汇总 Agent 的 Pi 会话。
+  state.activeSession = session; // 让 submit_merge_plan 成功后可以主动终止会话。
+  await input.trace.record("aggregator_context_bounded", { agentRole: "aggregator", specialistCount: prepared.payload.length, payloadChars: prepared.payloadChars, maxContextChars: MAX_AGGREGATOR_CONTEXT_CHARS, maxFindingsPerSpecialist: 30, truncatedFindings: prepared.truncatedFindings, findingRefs: prepared.refs.size });
+  const run = await runSession({ session, trace: input.trace, role: "aggregator", maxTurns: input.maxTurns ?? 12, maxSeconds: input.aggregatorSeconds ?? input.maxSeconds ?? 90, submitToolName: "submit_merge_plan" }, aggregatorPrompt(prepared.payload, failedRoles), () => state.submitted); // 执行汇总 Prompt 和提交工具。
+  // 工具层已经校验过一次；这里再校验一次，作为不依赖工具实现的可信边界。
+  const plan = validateMergePlan(run.submitted, prepared.refs); // 已校验的汇总去重方案。
+  const assembled = assembleMergedResult(prepared.payload, plan, input.initialChecks ?? []); // 按 ref 搬运正文并组装最终结果。
+  const validated = validateReviewResult(assembled, input.initialChecks ?? [], input.context.changes.map((change) => change.path)); // 对组装结果做与专家一致的最终校验。
+  await input.trace.record("aggregator_merge_plan", { agentRole: "aggregator", totalRefs: prepared.refs.size, kept: plan.keep.length, dropped: prepared.refs.size - plan.keep.length });
   await input.trace.record("agent_end", { agentRole: "aggregator", findings: validated.findings.length, checks: validated.checks.length, telemetry: run.telemetry });
   return { ...validated, telemetry: run.telemetry };
 }

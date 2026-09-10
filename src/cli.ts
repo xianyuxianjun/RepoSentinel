@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { initConfig } from "./config.js";
+import { initConfig, loadConfig, DEFAULT_MODEL_REFERENCE } from "./config.js";
 import { runReview } from "./review.js";
 import { readFile } from "node:fs/promises";
 import { compareEvalSummaries, type EvalSummary } from "./eval.js";
@@ -21,7 +21,7 @@ Usage:
   repo-sentinel review [--repo <path>] [--base <ref>] [--head <ref>] [--config <path>] [--output <path>] [--allow-dirty] [--dry-run]
   repo-sentinel eval --dataset <path>
     [--baseline <summary.json>] [--max-quality-drop <fraction>] [--max-p95-increase <fraction>]
-  repo-sentinel diagnose [--repo <path>]
+  repo-sentinel diagnose [--repo <path>] [--config <path>]
 `);
 }
 
@@ -58,7 +58,10 @@ async function main(): Promise<number> {
   }
   if (command === "diagnose") {
     const { runAgentDiagnostic } = await import("./diagnose.js");
-    const diagnostic = await runAgentDiagnostic(valueAfter(args, "--repo") ?? process.cwd()); // 执行 Provider 和 Tool Calling 诊断。
+    const repo = valueAfter(args, "--repo") ?? process.cwd(); // 诊断的仓库路径。
+    // 复用 review 的配置，保证 diagnose 探测的就是 review 实际会用的模型。
+    const config = await loadConfig(repo, valueAfter(args, "--config"));
+    const diagnostic = await runAgentDiagnostic(repo, { modelReference: config.review.model ?? DEFAULT_MODEL_REFERENCE }); // 执行 Provider 和 Tool Calling 诊断。
     console.log(JSON.stringify(diagnostic, null, 2));
     return diagnostic.ok ? 0 : 2;
   }

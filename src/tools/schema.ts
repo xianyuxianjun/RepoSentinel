@@ -12,3 +12,16 @@ export const reviewResultSchema = Type.Object({ // Agent 提交结果的运行�
   })),
   limitations: Type.Array(Type.String()), nextActions: Type.Array(Type.String()), mergeRecommendation: Type.Optional(Type.String()),
 });
+
+/**
+ * 汇总 Agent 的运行时 schema。
+ *
+ * 汇总阶段不接受 Finding 正文，只接受 keep（保留哪些 ref）和摘要，
+ * 正文由主控按 ref 原样搬运，因此模型无法在汇总时篡改证据。
+ */
+export const mergePlanSchema = Type.Object({ // 汇总去重方案的运行时结构约束。
+  summary: Type.String({ maxLength: 500 }),
+  keep: Type.Array(Type.String()),
+  limitations: Type.Array(Type.String()),
+  nextActions: Type.Array(Type.String()),
+});

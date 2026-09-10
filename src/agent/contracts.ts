@@ -3,6 +3,7 @@
 import { createAgentSession } from "@earendil-works/pi-coding-agent";
 import type { AgentSessionEvent } from "@earendil-works/pi-coding-agent";
 import type { CheckResult, GitContext, ReviewResult, SentinelConfig } from "../types.js";
+import type { ResolvedReviewModel } from "../model-runtime.js";
 import { TraceRecorder } from "../trace.js";
 
 /** Agent 编排层的输入契约；业务代码通过这些接口与 Pi SDK 解耦。 */
@@ -24,6 +25,11 @@ export interface AgentRunInput {
   instructions?: string;
   includeCheckTool?: boolean;
   includeContextTools?: boolean;
+  /**
+   * 本次运行显式选定的模型。
+   * 未提供时 createAgentSession 会回退到 Pi 默认设置，测试注入的 Fake Session 也走这条路径。
+   */
+  agentModel?: ResolvedReviewModel;
   createAgentSession?: AgentSessionFactory;
 }
 

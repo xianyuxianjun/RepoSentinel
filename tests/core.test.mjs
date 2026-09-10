@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { DEFAULT_CONFIG, validateConfig } from "../dist/config.js";
+import { resolveReviewModel } from "../dist/model-runtime.js";
 import { assertSafeCommand, isPathAllowed } from "../dist/policy.js";
 import { computeRecommendation, renderMarkdown, validateReviewResult } from "../dist/report.js";
 import { renderSarif } from "../dist/sarif.js";
@@ -9,6 +10,8 @@ import { MAX_READ_LINE_NUMBER, MAX_READ_LINE_SPAN, readRepositoryFile, searchRep
 import { writeRun } from "../dist/report.js";
 import { executeCheck } from "../dist/checks.js";
 import { getContextChunk, runMultiAgentReview } from "../dist/agent.js";
+import { assembleMergedResult, buildAggregatorPayload } from "../dist/agent/aggregator.js";
+import { validateMergePlan } from "../dist/tools/review.js";
 import { executeChecksOnce } from "../dist/review.js";
 import { compareEvalSummaries, runEvaluation } from "../dist/eval.js";
 import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
@@ -65,9 +68,9 @@ test("requires every enabled required check to have a result", () => {
 });
 
 test("validates bounded multi-agent review settings", () => {
-  assert.equal(DEFAULT_CONFIG.review.maxParallelAgents, 1);
-  assert.equal(DEFAULT_CONFIG.review.maxSpecialistSeconds, 90);
-  assert.equal(DEFAULT_CONFIG.review.maxAggregatorSeconds, 90);
+  assert.equal(DEFAULT_CONFIG.review.maxParallelAgents, 4);
+  assert.equal(DEFAULT_CONFIG.review.maxSpecialistSeconds, 300);
+  assert.equal(DEFAULT_CONFIG.review.maxAggregatorSeconds, 180);
   const config = validateConfig({ version: 1, review: { maxParallelAgents: 2, maxSpecialistSeconds: 30, maxAggregatorSeconds: 45 } });
   assert.equal(config.review.maxParallelAgents, 2);
   assert.equal(config.review.maxSpecialistSeconds, 30);
@@ -76,6 +79,23 @@ test("validates bounded multi-agent review settings", () => {
   assert.throws(() => validateConfig({ version: 1, review: { maxDiffBytes: 5_000_001 } }), /Diff 字节数/);
   assert.throws(() => validateConfig({ version: 1, commandPolicy: { maxOutputBytes: 5_000_001 } }), /输出字节数/);
   assert.throws(() => validateConfig({ version: 1, review: { maxDiffBytes: Infinity } }), /有限正数/);
+});
+
+test("validates the configured review model reference", () => {
+  assert.equal(DEFAULT_CONFIG.review.model, "deepseek/deepseek-v4-pro");
+  assert.equal(validateConfig({ version: 1 }).review.model, "deepseek/deepseek-v4-pro");
+  assert.equal(validateConfig({ version: 1, review: { model: " gpt/gpt-5.6-terra " } }).review.model, "gpt/gpt-5.6-terra");
+  assert.equal(validateConfig({ version: 1, review: { model: "deepseek/deepseek-v4-pro:high" } }).review.model, "deepseek/deepseek-v4-pro:high");
+  assert.throws(() => validateConfig({ version: 1, review: { model: "" } }), /review\.model/);
+  assert.throws(() => validateConfig({ version: 1, review: { model: "   " } }), /review\.model/);
+  assert.throws(() => validateConfig({ version: 1, review: { model: "a".repeat(201) } }), /review\.model/);
+  assert.throws(() => validateConfig({ version: 1, review: { model: "deepseek/deep\nseek-pro" } }), /review\.model/);
+  assert.throws(() => validateConfig({ version: 1, review: { model: 42 } }), /review\.model/);
+});
+
+test("reports an actionable error when the model reference cannot be resolved", async () => {
+  const emptyRuntime = { getAvailable: async () => [] }; // 不访问真实 Pi 配置和网络的 Runtime 替身。
+  await assert.rejects(resolveReviewModel("deepseek/does-not-exist", emptyRuntime), /无法解析模型/);
 });
 
 test("validates configurable specialist roles", () => {
@@ -128,11 +148,21 @@ test("keeps recommendation inconclusive when orchestration is incomplete", () =>
   assert.equal(result, "inconclusive");
 });
 
-test("does not approve when a specialist is missing", () => {
+test("does not claim success when a specialist is missing", () => {
   const result = computeRecommendation({ schemaVersion: 1, summary: "", checks: [
     { checkId: "test", category: "test", commandId: "test", displayCommand: "npm test", status: "passed", startedAt: "", finishedAt: "", durationMs: 0, output: "", outputTruncated: false },
   ], findings: [], limitations: ["专家 Agent security 未完成结构化审查。"], nextActions: [] }, DEFAULT_CONFIG);
-  assert.equal(result, "approve_with_notes");
+  // 缺失专家时无法声称“通过”，必须让 CI 看到无法完成验证。
+  assert.equal(result, "inconclusive");
+});
+
+test("still blocks when a verified high finding exists next to a missing specialist", () => {
+  const finding = { id: "finding_1", severity: "high", category: "logic_risk", title: "负索引切片", summary: "s", location: { path: "src/a.ts", startLine: 1, endLine: 1 }, evidence: [{ type: "diff", reference: "src/a.ts", summary: "e" }], confidence: 0.9, suggestedFix: "f", verificationStatus: "verified" };
+  const result = computeRecommendation({ schemaVersion: 1, summary: "", checks: [
+    { checkId: "test", category: "test", commandId: "test", displayCommand: "npm test", status: "passed", startedAt: "", finishedAt: "", durationMs: 0, output: "", outputTruncated: false },
+  ], findings: [finding], limitations: ["专家 Agent security 未完成结构化审查。"], nextActions: [] }, DEFAULT_CONFIG);
+  // 已经有 high+verified 证据时，阻断结论比“无法确认”更可用，不能因为专家缺失就降级为不可操作。
+  assert.equal(result, "needs_changes");
 });
 
 test("caps process output by bytes for unicode text", async () => {
@@ -179,6 +209,7 @@ test("runs specialist and aggregator orchestration through an injectable session
   const createAgentSession = async (options) => {
     sessionCount += 1;
     const submit = options.customTools.find((tool) => tool.name === "submit_review");
+    const submitPlan = options.customTools.find((tool) => tool.name === "submit_merge_plan"); // 汇总 Agent 提交的是去重方案而不是完整结果。
     let listener;
     return {
       session: {
@@ -189,10 +220,15 @@ test("runs specialist and aggregator orchestration through an injectable session
         dispose: () => {},
         prompt: async (message) => {
           listener?.({ type: "turn_start" });
-          listener?.({ type: "tool_execution_start", toolName: "submit_review", toolCallId: `call-${sessionCount}` });
+          const toolName = options.customTools[0].name; // 专家用 submit_review，汇总 Agent 用 submit_merge_plan。
+          listener?.({ type: "tool_execution_start", toolName, toolCallId: `call-${sessionCount}` });
           listener?.({ type: "message_end", message: { role: "assistant", content: [], usage: { input: 10, output: 4, cacheRead: 2, cacheWrite: 1, cost: { total: 0.002 } } } });
-          const result = { summary: message.includes("汇总 Agent") ? "aggregated" : "specialist", findings: [], limitations: [], nextActions: [], mergeRecommendation: "approve" };
-          await submit.execute("fake-submit", { result });
+          const summary = message.includes("汇总 Agent") ? "aggregated" : "specialist";
+          if (submitPlan) {
+            await submitPlan.execute("fake-plan", { plan: { summary, keep: [], limitations: [], nextActions: [] } });
+          } else {
+            await submit.execute("fake-submit", { result: { summary, findings: [], limitations: [], nextActions: [], mergeRecommendation: "approve" } });
+          }
           listener?.({ type: "agent_settled" });
         },
       },
@@ -228,8 +264,174 @@ test("runs specialist and aggregator orchestration through an injectable session
   assert.equal(result.telemetry.totalCost, 0.006);
 });
 
-test("scores evaluation telemetry and latency through an injectable runner", async () => {
-  const dataset = await mkdtemp(join(tmpdir(), "repo-sentinel-eval-"));
+test("forwards the resolved review model into every agent session", async () => {
+  const seenOptions = []; // 每个 Session 实际收到的 createAgentSession 选项。
+  const fakeModel = { provider: "deepseek", id: "deepseek-v4-pro" };
+  const fakeRuntime = { name: "fake-runtime" };
+  const agentModel = { model: fakeModel, thinkingLevel: "high", modelRuntime: fakeRuntime, reference: "deepseek/deepseek-v4-pro" };
+  const createAgentSession = async (options) => {
+    seenOptions.push(options);
+    const submit = options.customTools.find((tool) => tool.name === "submit_review");
+    const submitPlan = options.customTools.find((tool) => tool.name === "submit_merge_plan"); // 汇总 Agent 提交的是去重方案而不是完整结果。
+    let listener;
+    return {
+      session: {
+        model: { id: "fake-agent" },
+        getActiveToolNames: () => options.tools,
+        subscribe: (next) => { listener = next; return () => {}; },
+        abort: () => {},
+        dispose: () => {},
+        prompt: async () => {
+          listener?.({ type: "turn_start" });
+          if (submitPlan) {
+            await submitPlan.execute("fake-plan", { plan: { summary: "ok", keep: [], limitations: [], nextActions: [] } });
+          } else {
+            await submit.execute("fake-submit", { result: { summary: "ok", findings: [], limitations: [], nextActions: [], mergeRecommendation: "approve" } });
+          }
+          listener?.({ type: "agent_settled" });
+        },
+      },
+    };
+  };
+  const config = {
+    ...DEFAULT_CONFIG,
+    review: { ...DEFAULT_CONFIG.review, maxParallelAgents: 1, roles: [{ id: "logic", instructions: "检查逻辑", enabled: true }] },
+  };
+  const context = {
+    repositoryRoot: process.cwd(), currentBranch: "feature", dirty: false,
+    base: { ref: "main", sha: "base" }, head: { ref: "HEAD", sha: "head" },
+    changes: [{ path: "src/change.ts", status: "modified", additions: 1, deletions: 0 }],
+    diff: "diff --git a/src/change.ts b/src/change.ts", diffTruncated: false,
+  };
+  const initialChecks = [{ checkId: "test", category: "test", commandId: "test", displayCommand: "npm test", status: "passed", startedAt: "", finishedAt: "", durationMs: 1, output: "", outputTruncated: false }];
+  const baseInput = {
+    repositoryRoot: process.cwd(), context, config, trace: { record: async () => {} }, initialChecks,
+    maxTurns: 3, maxParallelAgents: 1, specialistSeconds: 1, aggregatorSeconds: 1, createAgentSession,
+  };
+  await runMultiAgentReview({ ...baseInput, agentModel });
+  // 一个专家加一个汇总 Agent：两者必须使用同一个已解析模型，否则报告会混用模型。
+  assert.equal(seenOptions.length, 2);
+  for (const options of seenOptions) {
+    assert.equal(options.model, fakeModel);
+    assert.equal(options.modelRuntime, fakeRuntime);
+    assert.equal(options.thinkingLevel, "high");
+  }
+  // 未配置模型时不能凭空注入模型，必须保持 Pi 默认解析路径。
+  seenOptions.length = 0;
+  await runMultiAgentReview(baseInput);
+  assert.equal(seenOptions.length, 2);
+  for (const options of seenOptions) {
+    assert.equal(options.model, undefined);
+    assert.equal(options.modelRuntime, undefined);
+    assert.equal(options.thinkingLevel, "low");
+  }
+});
+
+/** 构造一条结构完整的 Finding，便于在汇总测试里验证“搬运前后是否一致”。 */
+function makeFinding(id, title, extra = {}) {
+  return {
+    id, severity: "medium", category: "logic_risk", title, summary: `${title} 的说明`,
+    location: { path: "src/a.ts", startLine: 7, endLine: 9 },
+    evidence: [{ type: "diff", reference: "src/a.ts", summary: "证据" }],
+    confidence: 0.7, suggestedFix: "修复", verificationStatus: "verified", ...extra,
+  };
+}
+
+function specialistSuccess(role, findings) {
+  return { role, result: { schemaVersion: 1, summary: "", checks: [], findings, limitations: [], nextActions: [] } };
+}
+
+test("assigns stable refs and strips per-specialist finding ids from the aggregator payload", () => {
+  const prepared = buildAggregatorPayload([
+    specialistSuccess("logic", [makeFinding("finding_1", "负索引切片"), makeFinding("finding_2", "仅按空格分词")]),
+    specialistSuccess("security", [makeFinding("finding_1", "负索引切片")]),
+  ]);
+  // 两个专家都有 finding_1：必须靠 ref 区分，否则模型无法表达“保留哪一条”。
+  assert.deepEqual([...prepared.refs], ["logic#1", "logic#2", "security#1"]);
+  assert.equal("id" in prepared.payload[0].findings[0], false);
+});
+
+test("assembles merged findings by ref without re-emitting their bodies", () => {
+  const successes = [
+    specialistSuccess("logic", [makeFinding("finding_1", "负索引切片"), makeFinding("finding_2", "仅按空格分词")]),
+    specialistSuccess("quality", [makeFinding("finding_1", "负索引切片（重复）")]),
+  ];
+  const { payload, refs } = buildAggregatorPayload(successes);
+  const plan = validateMergePlan({ summary: "合并结论", keep: ["logic#1", "logic#2"], limitations: ["限制"], nextActions: ["动作"] }, refs);
+  const merged = assembleMergedResult(payload, plan, []);
+  // 保留两条、丢弃 quality 的重复项，且正文必须与专家原文一致（模型没有机会改写证据）。
+  assert.deepEqual(merged.findings.map((finding) => finding.id), ["finding_1", "finding_2"]);
+  assert.deepEqual(merged.findings.map((finding) => finding.title), ["负索引切片", "仅按空格分词"]);
+  assert.deepEqual(merged.findings[0].evidence, successes[0].result.findings[0].evidence);
+  assert.equal(merged.findings[0].severity, "medium");
+  assert.equal(merged.findings[0].location.path, "src/a.ts");
+  assert.equal("ref" in merged.findings[0], false);
+  assert.equal(merged.summary, "合并结论");
+});
+
+test("rejects merge plans that invent refs, drop every finding, or exceed the summary budget", () => {
+  const refs = new Set(["logic#1"]);
+  assert.throws(() => validateMergePlan({ summary: "s", keep: ["logic#9"] }, refs), /不存在的 Finding/);
+  assert.throws(() => validateMergePlan({ summary: "s", keep: [] }, refs), /至少需要保留/);
+  assert.throws(() => validateMergePlan({ summary: "x".repeat(501), keep: ["logic#1"] }, refs), /500/);
+  assert.throws(() => validateMergePlan({ summary: "", keep: ["logic#1"] }, refs), /summary/);
+  // 重复 ref 不应被重复计入保留列表。
+  assert.deepEqual(validateMergePlan({ summary: "s", keep: ["logic#1", "logic#1"] }, refs).keep, ["logic#1"]);
+});
+
+test("deduplicates duplicate findings end to end through the merge-plan tool", async () => {
+  const aggregateTools = []; // 汇总 Session 实际拿到的工具名，用于确认它拿不到 submit_review。
+  const createAgentSession = async (options) => {
+    const isAggregator = options.tools.includes("submit_merge_plan");
+    if (isAggregator) aggregateTools.push(...options.tools);
+    const submit = options.customTools.find((tool) => tool.name === "submit_review");
+    const mergePlan = options.customTools.find((tool) => tool.name === "submit_merge_plan");
+    let listener;
+    return {
+      session: {
+        model: { id: "fake-agent" },
+        getActiveToolNames: () => options.tools,
+        subscribe: (next) => { listener = next; return () => {}; },
+        abort: () => {}, dispose: () => {},
+        prompt: async (message) => {
+          listener?.({ type: "turn_start" });
+          if (isAggregator) {
+            // 两个专家的同名问题标题不同、行号不同，确定性 key 去不掉，只有模型能判断它们是同一根因。
+            await mergePlan.execute("plan", { plan: { summary: "deduped", keep: ["logic#1"], limitations: [], nextActions: [] } });
+          } else {
+            const title = message.includes("logic") ? "负索引切片" : "maxChars 小于省略号时结果超长";
+            await submit.execute("submit", { result: { summary: "specialist", findings: [makeFinding("finding_1", title)], limitations: [], nextActions: [], mergeRecommendation: "approve" } });
+          }
+          listener?.({ type: "agent_settled" });
+        },
+      },
+    };
+  };
+  const config = {
+    ...DEFAULT_CONFIG,
+    review: { ...DEFAULT_CONFIG.review, maxParallelAgents: 1, roles: [
+      { id: "logic", instructions: "检查逻辑", enabled: true },
+      { id: "quality", instructions: "检查质量", enabled: true },
+    ] },
+  };
+  const context = {
+    repositoryRoot: process.cwd(), currentBranch: "feature", dirty: false,
+    base: { ref: "main", sha: "base" }, head: { ref: "HEAD", sha: "head" },
+    changes: [{ path: "src/a.ts", status: "modified", additions: 1, deletions: 0 }],
+    diff: "diff --git a/src/a.ts b/src/a.ts", diffTruncated: false,
+  };
+  const result = await runMultiAgentReview({
+    repositoryRoot: process.cwd(), context, config, trace: { record: async () => {} }, initialChecks: [],
+    maxTurns: 3, maxParallelAgents: 1, specialistSeconds: 1, aggregatorSeconds: 1, createAgentSession,
+  });
+  assert.equal(result.findings.length, 1); // 两条重复被去重成一条。
+  assert.equal(result.findings[0].id, "finding_1");
+  assert.equal(result.findings[0].evidence.length, 1); // 证据由主控搬运，未经过模型转述。
+  assert.equal(result.summary, "deduped");
+  assert.deepEqual(aggregateTools, ["submit_merge_plan"]); // 汇总 Agent 不再拥有提交完整结果的工具。
+});
+
+test("scores evaluation telemetry and latency through an injectable runner", async () => {  const dataset = await mkdtemp(join(tmpdir(), "repo-sentinel-eval-"));
   for (const [id, title] of [["clean", undefined], ["bug", "null dereference"]]) {
     const directory = join(dataset, id);
     await mkdir(directory, { recursive: true });
