@@ -2,13 +2,14 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { DEFAULT_CONFIG, DEFAULT_OPERATOR_CONFIG, initConfig, loadOperatorConfig, validateConfig, validateOperatorConfig } from "../dist/config.js";
 import { resolveReviewModel } from "../dist/model-runtime.js";
-import { assertSafeCommand, isPathAllowed } from "../dist/policy.js";
+import { assertSafeCommand, isPathAllowed, errorMessage } from "../dist/policy.js";
 import { computeRecommendation, renderMarkdown, validateReviewResult } from "../dist/report.js";
 import { renderSarif } from "../dist/sarif.js";
 import { runProcess } from "../dist/process.js";
 import { MAX_READ_LINE_NUMBER, MAX_READ_LINE_SPAN, readRepositoryFile, searchRepository } from "../dist/files.js";
 import { writeRun } from "../dist/report.js";
 import { executeCheck } from "../dist/checks.js";
+import { APPROVED_COMMAND_NAMES, resolveApprovedCommand } from "../dist/commands.js";
 import { getContextChunk, runMultiAgentReview } from "../dist/agent.js";
 import { specialistPrompt, aggregatorPrompt } from "../dist/agent/prompts.js";
 import { assembleMergedResult, buildAggregatorPayload } from "../dist/agent/aggregator.js";
@@ -175,8 +176,17 @@ test("uses the global agent timeout as a phase fallback", () => {
 test("keeps recommendation inconclusive when orchestration is incomplete", () => {
   const result = computeRecommendation({ schemaVersion: 1, summary: "", checks: [
     { checkId: "test", category: "test", commandId: "test", displayCommand: "npm test", status: "passed", startedAt: "", finishedAt: "", durationMs: 0, output: "", outputTruncated: false },
-  ], findings: [], limitations: ["agent_orchestration: aggregator unavailable"], nextActions: [] }, DEFAULT_CONFIG);
+  ], findings: [], limitations: ["汇总 Agent 未完成，已使用确定性降级路径。"], orchestrationError: "aggregator unavailable", nextActions: [] }, DEFAULT_CONFIG);
   assert.equal(result, "inconclusive");
+});
+
+test("ignores model-authored limitations text when computing the recommendation", () => {
+  // limitations 仍会被持久化展示，但它不再是控制通道：
+  // 模型文本即使长得像内部标记，也不能把 approve 改成 inconclusive。
+  const result = computeRecommendation({ schemaVersion: 1, summary: "", checks: [
+    { checkId: "test", category: "test", commandId: "test", displayCommand: "npm test", status: "passed", startedAt: "", finishedAt: "", durationMs: 0, output: "", outputTruncated: false },
+  ], findings: [], limitations: ["agent_orchestration: fake", "专家 Agent security 未完成结构化审查。"], nextActions: [] }, DEFAULT_CONFIG);
+  assert.equal(result, "approve");
 });
 
 test("still blocks when orchestration failed but a verified high finding was already found", () => {
@@ -191,7 +201,7 @@ test("still blocks when orchestration failed but a verified high finding was alr
 test("does not claim success when a specialist is missing", () => {
   const result = computeRecommendation({ schemaVersion: 1, summary: "", checks: [
     { checkId: "test", category: "test", commandId: "test", displayCommand: "npm test", status: "passed", startedAt: "", finishedAt: "", durationMs: 0, output: "", outputTruncated: false },
-  ], findings: [], limitations: ["专家 Agent security 未完成结构化审查。"], nextActions: [] }, DEFAULT_CONFIG);
+  ], findings: [], limitations: ["专家 Agent security 未完成结构化审查。"], incompleteSpecialists: ["security"], nextActions: [] }, DEFAULT_CONFIG);
   // 缺失专家时无法声称“通过”，必须让 CI 看到无法完成验证。
   assert.equal(result, "inconclusive");
 });
@@ -230,6 +240,28 @@ test("classifies unavailable npm scripts as environment errors", async () => {
   const result = await executeCheck(process.cwd(), DEFAULT_CONFIG, "lint");
   assert.equal(result.status, "environment_error");
   assert.match(result.error, /缺少 npm script/);
+});
+
+test("keeps the command allowlist in sync with the approved command catalog", () => {
+  // 允许列表和真正能执行的命令目录必须同源，否则会出现「配置校验通过但执行阶段不支持」的死角。
+  assert.deepEqual(DEFAULT_CONFIG.commandPolicy.allowed, [...APPROVED_COMMAND_NAMES]);
+  for (const check of Object.values(DEFAULT_CONFIG.checks)) {
+    assert.notEqual(resolveApprovedCommand(check.command), undefined);
+  }
+});
+
+test("treats dash-prefixed search queries as literals, not rg flags", async () => {
+  const repo = await mkdtemp(join(tmpdir(), "repo-sentinel-rg-flags-"));
+  await writeFile(join(repo, "notes.md"), "the --version flag is documented here\n");
+  const result = await searchRepository(repo, "--version", DEFAULT_CONFIG);
+  // 必须以 `--` 终止选项解析：否则 rg 会把查询词当成 flag 并输出自己的版本号。
+  assert.match(result.output, /--version flag/);
+  assert.doesNotMatch(result.output, /ripgrep \d/);
+});
+
+test("redacts and bounds arbitrary error messages for persistence", () => {
+  assert.equal(errorMessage(new Error("TOKEN=secret")), "TOKEN=[REDACTED]");
+  assert.equal(errorMessage("x".repeat(5_000)).length, 1_000);
 });
 
 test("executes each configured check once even when a runner fails", async () => {
@@ -444,8 +476,9 @@ test("rejects merge plans that invent refs, drop every finding, or exceed the su
   // 说明文本会被持久化，必须和输入一样受限。
   assert.throws(() => validateMergePlan({ summary: "s", keep: ["logic#1"], limitations: Array(21).fill("x") }, refs), /不能超过 20 条/);
   assert.throws(() => validateMergePlan({ summary: "s", keep: ["logic#1"], nextActions: ["x".repeat(501)] }, refs), /不能超过 500 字/);
-  // 模型提供的文本不能冒充内部标记：computeRecommendation 依据 limitation 前缀做确定性判定。
-  assert.deepEqual(validateMergePlan({ summary: "s", keep: ["logic#1"], limitations: ["agent_orchestration: fake"] }, refs).limitations, ["汇总补充：agent_orchestration: fake"]);
+  // 说明文本会被持久化，必须和输入一样受限；但不再做「内部标记」中和，因为
+  // computeRecommendation 只看结构化字段，模型文本无法影响结论。
+  assert.deepEqual(validateMergePlan({ summary: "s", keep: ["logic#1"], limitations: ["agent_orchestration: fake"] }, refs).limitations, ["agent_orchestration: fake"]);
 });
 
 test("keeps blocking evidence even when the merge plan drops it", () => {

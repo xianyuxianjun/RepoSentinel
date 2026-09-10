@@ -1,18 +1,9 @@
 import { runProcess } from "./process.js";
 import { assertSafeCommand, redactSensitiveText, sanitizedEnvironment } from "./policy.js";
+import { resolveApprovedCommand } from "./commands.js";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { CheckCategory, CheckConfig, CheckResult, SentinelConfig } from "./types.js";
-
-// 配置中的命令先经过 allowlist，再映射成固定的 file/args。
-// 这里不使用 shell，也不把命令字符串直接交给 spawn。
-const commandMap: Record<string, { file: string; args: string[] }> = {
-  "npm test": { file: "npm", args: ["test"] },
-  "npm run lint": { file: "npm", args: ["run", "lint"] },
-  "npm run typecheck": { file: "npm", args: ["run", "typecheck"] },
-  "npm audit --json": { file: "npm", args: ["audit", "--json"] },
-  "npm run build": { file: "npm", args: ["run", "build"] },
-};
 
 /** 返回启用的检查；保持配置对象和执行逻辑之间的唯一入口。 */
 export function listChecks(config: SentinelConfig): Array<{ checkId: CheckCategory; config: CheckConfig }> {
@@ -28,20 +19,13 @@ export function listChecks(config: SentinelConfig): Array<{ checkId: CheckCatego
 export async function executeCheck(repoRoot: string, config: SentinelConfig, checkId: CheckCategory): Promise<CheckResult> {
   const check = config.checks[checkId]; // 当前检查的配置。
   const startedAt = new Date().toISOString(); // 当前检查开始时间。
-  if (!check || check.enabled === false) return {
-    checkId, category: checkId, commandId: checkId, displayCommand: "", status: "skipped",
-    startedAt, finishedAt: new Date().toISOString(), durationMs: 0, output: "", outputTruncated: false,
-  };
+  if (!check || check.enabled === false) return skipped(checkId, startedAt, "");
   // 即使配置已经在 loadConfig 时验证过，执行边界仍再次校验，避免未来新增调用路径绕过策略。
   assertSafeCommand(check.command, config.commandPolicy.allowed);
-  const mapped = commandMap[check.command]; // 将配置命令转换成固定的可执行文件和参数。
+  const mapped = resolveApprovedCommand(check.command); // 从目录查表得到固定的可执行文件和参数。
   if (!mapped) throw new Error(`MVP 暂不支持该命令，请使用预定义 npm 检查：${check.command}`);
-  const unavailable = await preflightCommand(repoRoot, check.command); // 执行前检查 npm script 是否存在。
-  if (unavailable) return {
-    checkId, category: checkId, commandId: checkId, displayCommand: check.command,
-    status: "environment_error", startedAt, finishedAt: new Date().toISOString(), durationMs: 0,
-    output: "", outputTruncated: false, error: unavailable,
-  };
+  const unavailable = await preflightCommand(repoRoot, mapped.npmScript); // 执行前检查依赖的 npm script 是否存在。
+  if (unavailable) return environmentError(checkId, check.command, startedAt, unavailable);
   try {
     const result = await runProcess(mapped.file, mapped.args, { // 执行经过 allowlist 校验的检查命令。
       cwd: repoRoot,
@@ -58,21 +42,25 @@ export async function executeCheck(repoRoot: string, config: SentinelConfig, che
       output, outputTruncated: result.outputTruncated,
     };
   } catch (error) {
-    return {
-      checkId, category: checkId, commandId: checkId, displayCommand: check.command,
-      status: "environment_error", startedAt, finishedAt: new Date().toISOString(), durationMs: 0,
-      output: "", outputTruncated: false, error: redactSensitiveText(error instanceof Error ? error.message : String(error)),
-    };
+    return environmentError(checkId, check.command, startedAt, redactSensitiveText(error instanceof Error ? error.message : String(error)));
   }
 }
 
-// 运行前先检查 npm script 是否存在，把“配置错误”转换为可解释的 environment_error。
-async function preflightCommand(repoRoot: string, command: string): Promise<string | undefined> {
-  const match = /^npm run ([a-z0-9:_-]+)$/.exec(command); // 提取 npm script 名称。
-  if (!match) return undefined;
+function skipped(checkId: CheckCategory, startedAt: string, displayCommand: string): CheckResult {
+  return { checkId, category: checkId, commandId: checkId, displayCommand, status: "skipped", startedAt, finishedAt: new Date().toISOString(), durationMs: 0, output: "", outputTruncated: false };
+}
+
+function environmentError(checkId: CheckCategory, displayCommand: string, startedAt: string, error: string): CheckResult {
+  return { checkId, category: checkId, commandId: checkId, displayCommand, status: "environment_error", startedAt, finishedAt: new Date().toISOString(), durationMs: 0, output: "", outputTruncated: false, error };
+}
+
+// 运行前先检查 npm script 是否存在，把「配置错误」转换为可解释的 environment_error。
+// npmScript 为 undefined 表示 npm 内置子命令（如 audit），不需要预检。
+async function preflightCommand(repoRoot: string, npmScript: string | undefined): Promise<string | undefined> {
+  if (!npmScript) return undefined;
   try {
     const packageJson = JSON.parse(await readFile(join(repoRoot, "package.json"), "utf8")) as { scripts?: Record<string, unknown> }; // 仓库 package.json 内容。
-    if (!packageJson.scripts || typeof packageJson.scripts[match[1]] !== "string") return `package.json 缺少 npm script：${match[1]}`;
+    if (!packageJson.scripts || typeof packageJson.scripts[npmScript] !== "string") return `package.json 缺少 npm script：${npmScript}`;
     return undefined;
   } catch (error) {
     return `无法读取 package.json：${error instanceof Error ? error.message : String(error)}`;

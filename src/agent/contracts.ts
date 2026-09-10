@@ -53,6 +53,19 @@ export interface SpecialistResult {
   result: ReviewResult;
 }
 
+/** 专家未完成结构化审查时的显式失败分支；与成功分支构成可判别联合。 */
+export interface SpecialistFailure {
+  role: string;
+  error: unknown;
+}
+
+/**
+ * 单个专家角色的执行结果。
+ * 旧实现只在成功分支里声明 result，失败分支靠 `"result" in outcome` 就地猜测；
+ * 显式联合让「专家失败」在类型层面不可忽略。
+ */
+export type SpecialistOutcome = SpecialistResult | SpecialistFailure;
+
 /** 生产 Session 和测试 Fake Session 共享的最小能力集合。 */
 export interface AgentSessionLike {
   model?: { id?: string };

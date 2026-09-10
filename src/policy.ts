@@ -23,6 +23,37 @@ export function redactSensitiveText(value: string): string {
     .replace(/-----BEGIN [^-]+-----[\s\S]*?-----END [^-]+-----/g, "[REDACTED KEY]");
 }
 
+/**
+ * 会被整体替换为 [REDACTED] 的凭据字段名。
+ *
+ * 这里刻意使用精确字段名而不是宽泛的子串匹配：
+ * 旧实现用 /key|token|auth/i 匹配任意键名，会把 inputTokens、outputTokens 这类
+ * 正常遥测字段也一并抹掉，让 Trace 失去可审计性。
+ */
+const CREDENTIAL_KEY_PATTERN = /^(api[_-]?key|access[_-]?token|refresh[_-]?token|auth[_-]?token|token|secret|client[_-]?secret|password|credentials?|authorization|cookie)$/i;
+
+/** 持久化到报告或 Trace 的错误消息长度上限。 */
+const MAX_ERROR_MESSAGE_CHARS = 1_000;
+
+/** 把任意异常转成可持久化的短消息：脱敏并限长，供报告、Trace 和检查结果共用。 */
+export function errorMessage(error: unknown, maxChars = MAX_ERROR_MESSAGE_CHARS): string {
+  return redactSensitiveText(error instanceof Error ? error.message : String(error)).slice(0, maxChars);
+}
+
+/**
+ * 递归脱敏任意 JSON-likes 的 payload：
+ * 字符串走 redactSensitiveText，凭据字段直接整体替换，其余字段递归处理。
+ * Trace 等诊断出口共用这一份实现，避免各写一套正则产生脱敏盲区。
+ */
+export function redactPayload(value: unknown): unknown {
+  if (typeof value === "string") return redactSensitiveText(value);
+  if (Array.isArray(value)) return value.map(redactPayload);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, CREDENTIAL_KEY_PATTERN.test(key) ? "[REDACTED]" : redactPayload(item)]));
+  }
+  return value;
+}
+
 // 项目只需要支持有限的 glob 规则，因此用小型转换器避免引入额外依赖。
 function globToRegExp(pattern: string): RegExp {
   let source = "^"; // 正在构造的正则表达式文本。
@@ -49,7 +80,15 @@ export function isPathAllowed(repoRoot: string, candidate: string, config: { com
   const absolute = isAbsolute(candidate) ? resolve(candidate) : resolve(repoRoot, candidate); // 候选路径的绝对路径。
   const rel = relative(repoRoot, absolute).split(sep).join("/"); // 相对于仓库的标准化路径。
   if (rel === "" || rel === ".." || rel.startsWith("../") || isAbsolute(rel)) return false;
-  return !effectiveDenyPathPatterns(config.commandPolicy.denyPathPatterns).some((pattern) => globToRegExp(pattern.split(sep).join("/")).test(rel));
+  return !matchesDenyPath(rel, config.commandPolicy.denyPathPatterns);
+}
+
+/**
+ * 判断仓库内相对路径是否命中敏感路径规则（含系统基线）。
+ * 单独暴露出来，让 Diff 过滤等只拿到相对路径的调用方不必伪造一个 config 外壳。
+ */
+export function matchesDenyPath(relativePath: string, patterns: string[]): boolean {
+  return effectiveDenyPathPatterns(patterns).some((pattern) => globToRegExp(pattern.split(sep).join("/")).test(relativePath));
 }
 
 export function assertPathAllowed(repoRoot: string, candidate: string, config: { commandPolicy: Pick<SentinelConfig["commandPolicy"], "denyPathPatterns"> }): void {

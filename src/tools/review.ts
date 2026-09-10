@@ -3,7 +3,7 @@ import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import type { CheckResult, GitContext, MergePlan, ReviewResult, SentinelConfig } from "../types.js";
 import { executeCheck, listChecks } from "../checks.js";
-import { validateReviewResult, neutralizeInternalMarkers } from "../report.js";
+import { validateReviewResult } from "../report.js";
 import { MAX_READ_LINE_NUMBER, readRepositoryFile, searchRepository } from "../files.js";
 import { getContextChunk, MAX_CONTEXT_PAGE_CHARS } from "./context.js";
 import { mergePlanSchema, reviewResultSchema } from "./schema.js";
@@ -157,12 +157,13 @@ export function validateMergePlan(value: unknown, allowedRefs: ReadonlySet<strin
   // 有输入却被全部丢弃，通常意味着模型漏读了上下文，直接拒绝比默默清空问题列表更安全。
   if (allowedRefs.size > 0 && keep.length === 0) throw new Error("Merge plan 至少需要保留一条 Finding");
   // 说明文本会被持久化到 run.json/report.md，必须和输入一样受限。
+  // 不再做「内部标记」中和：结论判定改用结构化字段，模型文本不再是控制通道。
   const notes = (item: unknown, label: string): string[] => {
     if (!Array.isArray(item)) return [];
     const values = item.filter((entry): entry is string => typeof entry === "string");
     if (values.length > MAX_MERGE_NOTE_ITEMS) throw new Error(`Merge plan ${label} 不能超过 ${MAX_MERGE_NOTE_ITEMS} 条`);
     if (values.some((entry) => entry.length > MAX_MERGE_NOTE_CHARS)) throw new Error(`Merge plan ${label} 单条不能超过 ${MAX_MERGE_NOTE_CHARS} 字`);
-    return values.map(neutralizeInternalMarkers);
+    return values;
   };
   return { summary: plan.summary, keep, limitations: notes(plan.limitations, "limitations"), nextActions: notes(plan.nextActions, "nextActions") };
 }

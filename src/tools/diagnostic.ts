@@ -1,6 +1,7 @@
 import { createAgentSession, defineTool, SessionManager } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { resolveReviewModel, type ResolvedReviewModel } from "../model-runtime.js";
+import { redactSensitiveText } from "../policy.js";
 import type { ThinkingLevelName } from "../types.js";
 
 /** 诊断命令的窄结果模型，只报告 Session 是否能完成最小工具调用。 */
@@ -46,7 +47,7 @@ function summarize(message: unknown): Record<string, unknown> {
   return {
     role: value.role,
     stopReason: value.stopReason,
-    errorMessage: typeof value.errorMessage === "string" ? value.errorMessage.slice(0, 300).replace(/(api[_-]?key|token|secret|password)\s*[:=]\s*[^\s,;]+/gi, "$1=[REDACTED]") : undefined,
+    errorMessage: typeof value.errorMessage === "string" ? redactSensitiveText(value.errorMessage).slice(0, 300) : undefined,
     contentTypes: content.map((item) => item && typeof item === "object" ? (item as Record<string, unknown>).type : "unknown"),
     textChars: content.reduce<number>((total, item) => {
       if (!item || typeof item !== "object") return total;

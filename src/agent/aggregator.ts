@@ -1,6 +1,6 @@
 import { createAgentSession, SessionManager } from "@earendil-works/pi-coding-agent";
 import type { CheckResult, Finding, MergePlan, ReviewResult } from "../types.js";
-import { neutralizeInternalMarkers, validateReviewResult } from "../report.js";
+import { validateReviewResult } from "../report.js";
 import { runSession } from "./session.js";
 import { boundedPreview } from "../tools/context.js";
 import { aggregatorPrompt } from "./prompts.js";
@@ -72,37 +72,53 @@ export function buildAggregatorPayload(successes: SpecialistResult[]): { payload
     };
   });
   const droppedByCap = successes.reduce((total, { result }) => total + Math.max(0, result.findings.length - 30), 0); // 每个专家超过 30 条的 Finding 不会进入模型视野。
-  let payloadChars = JSON.stringify(payload).length; // 汇总输入当前占用的字符数。
-  let truncatedFindings = droppedByCap; // 未进入模型视野的 Finding 数量。
+  const { payloadChars, truncatedFindings, trimmedSections } = trimToBudget(payload, visibleRefs, droppedByCap); // 把投影压进上下文预算。
+  // refs 是“模型可引用的集合”，originals 是“可回查的完整集合”；
+  // 后者更大是故意的：被裁剪的阻断证据仍然要被兜底保留。
+  return { payload, payloadChars, truncatedFindings, trimmedSections, refs: visibleRefs, originals };
+}
+
+/** 汇总输入的字符数；作为预算判定的唯一度量。 */
+function measure(payload: AggregatorPayloadItem[]): number {
+  return JSON.stringify(payload).length;
+}
+
+/**
+ * 把汇总输入压到 MAX_AGGREGATOR_CONTEXT_CHARS 以内。
+ *
+ * 三层裁剪顺序是设计的一部分，不能调换：
+ * 1) 先删 Finding（保留角色与失败语义）；
+ * 2) 再删 limitations/nextActions（limitations/nextActions 本身也能占掉上万字符）；
+ * 3) 最后才压缩每个专家自己的 summary，尽量保住“每个专家说了什么”。
+ *
+ * visibleRefs 与 payload 同步删除，而 originals 保持不变：被裁掉的 high/critical
+ * 仍然能被确定性兜底保留，不会变成假通过。
+ */
+function trimToBudget(payload: AggregatorPayloadItem[], visibleRefs: Set<string>, initialTruncatedFindings: number): { payloadChars: number; truncatedFindings: number; trimmedSections: number } {
+  let payloadChars = measure(payload); // 汇总输入当前占用的字符数。
+  let truncatedFindings = initialTruncatedFindings; // 未进入模型视野的 Finding 数量。
   let trimmedSections = 0; // 因超出预算而删除的说明/摘要数量。
-  // 第一层：优先删除 Finding，而不是删除角色和限制信息；这样仍能保留失败语义。
   while (payloadChars > MAX_AGGREGATOR_CONTEXT_CHARS && payload.some((item) => item.findings.length > 0)) {
     const target = payload.reduce((current, item) => item.findings.length > current.findings.length ? item : current); // 找出 Finding 最多的专家，优先从它裁剪。
     const removed = target.findings.pop(); // 被裁掉的投影项。
-    // 只从“模型可见集合”里移除：originals 保留有完整集合，
-    // 否则被裁掉的 high/critical 会连兜底逻辑都看不到，直接变成假通过。
+    // 只从“模型可见集合”里移除：originals 保留完整集合，否则被裁掉的阻断证据连兜底逻辑都看不到。
     if (removed) visibleRefs.delete(removed.ref);
     truncatedFindings += 1;
-    payloadChars = JSON.stringify(payload).length;
+    payloadChars = measure(payload);
   }
-  // 第二层：Finding 清空后仍然超预算，说明只 pop Finding 会让预算变成软约束——
-  // 每个专家的 summary/limitations/nextActions 本身就能占掉上万字符。
   while (payloadChars > MAX_AGGREGATOR_CONTEXT_CHARS && payload.some((item) => item.limitations.length > 0 || item.nextActions.length > 0)) {
     const target = payload.reduce((current, item) => (item.limitations.length + item.nextActions.length) > (current.limitations.length + current.nextActions.length) ? item : current);
     if (target.limitations.length > 0) target.limitations.pop(); else target.nextActions.pop();
     trimmedSections += 1;
-    payloadChars = JSON.stringify(payload).length;
+    payloadChars = measure(payload);
   }
-  // 第三层：最后才压缩每个专家自己的 summary，尽量保住“每个专家说了什么”。
   while (payloadChars > MAX_AGGREGATOR_CONTEXT_CHARS && payload.some((item) => item.summary.length > 0)) {
     const target = payload.reduce((current, item) => item.summary.length > current.summary.length ? item : current);
     target.summary = target.summary.slice(0, Math.floor(target.summary.length / 2));
     trimmedSections += 1;
-    payloadChars = JSON.stringify(payload).length;
+    payloadChars = measure(payload);
   }
-  // refs 是“模型可引用的集合”，originals 是“可回查的完整集合”；
-  // 后者更大是故意的：被裁剪的阻断证据仍然要被兜底保留。
-  return { payload, payloadChars, truncatedFindings, trimmedSections, refs: visibleRefs, originals };
+  return { payloadChars, truncatedFindings, trimmedSections };
 }
 
 /** 组装最终结果所需的输入。 */
@@ -148,8 +164,8 @@ export function assembleMergedResult(input: MergeAssemblyInput): ReviewResult {
   }
   // 专家的 limitations/nextActions 记录的是“它没能验证什么”，属于不可丢失的事实；
   // 汇总 Prompt 已要求模型不要复述它们，因此必须由主控确定性合并，排在模型补充的全局信息之前。
-  // 专家的 limitations 同样是模型生成的文本，也要防止它们冒充内部标记。
-  const limitations = [...new Set([...input.specialists.flatMap(({ result }) => result.limitations.map(neutralizeInternalMarkers)), ...input.plan.limitations])];
+  // 专家的 limitations 同样是模型生成的文本，但不再当作内部标记解析：覆盖完整性由结构化字段承载。
+  const limitations = [...new Set([...input.specialists.flatMap(({ result }) => result.limitations), ...input.plan.limitations])];
   const nextActions = [...new Set([...input.specialists.flatMap(({ result }) => result.nextActions), ...input.plan.nextActions])];
   // 被裁掉的 Finding 不会进入报告，必须显式说明，否则读者会以为覆盖是完整的。
   if (input.truncatedFindings) limitations.unshift(`汇总输入超出 ${MAX_AGGREGATOR_CONTEXT_CHARS} 字符预算，${input.truncatedFindings} 条 Finding 未参与汇总，可能未出现在本报告中。`);
@@ -210,8 +226,19 @@ export function mergeSpecialistResults(successes: SpecialistResult[], checks: Mu
       findings.push({ ...finding, id: `finding_${findings.length + 1}` });
     }
   }
-  const limitations = [...new Set([...successes.flatMap(({ result }) => result.limitations.map(neutralizeInternalMarkers)), ...failedRoles.map((role) => `专家 Agent ${role} 未完成结构化审查。`), ...(reason !== undefined ? [`agent_orchestration: ${reason}`] : [])])];
+  const limitations = [...new Set([...successes.flatMap(({ result }) => result.limitations), ...failedRoles.map((role) => `专家 Agent ${role} 未完成结构化审查。`), ...(reason !== undefined ? [`agent_orchestration: ${reason}`] : [])])];
   // reason 用 !== undefined 判断而不是真值：空字符串的 error message 会跳过这条标记，
-  // 让一次降级结果看起来像正常合并（fail-open）。
-  return { schemaVersion: 1, mergeRecommendation: reason !== undefined ? "inconclusive" : "approve_with_notes", summary: `多 Agent 审查完成：${successes.length} 个专家 Agent 返回结果，合并 ${findings.length} 条去重 Finding。`, checks: checks ?? [], findings, limitations, nextActions: [...new Set(successes.flatMap(({ result }) => result.nextActions))] };
+  // 让一次降级结果看起来像正常合并（fail-open）。覆盖完整性由结构化字段承载，
+  // limitations 只作为人类可读说明，不再被 computeRecommendation 反向解析。
+  return {
+    schemaVersion: 1,
+    mergeRecommendation: reason !== undefined ? "inconclusive" : "approve_with_notes",
+    summary: `多 Agent 审查完成：${successes.length} 个专家 Agent 返回结果，合并 ${findings.length} 条去重 Finding。`,
+    checks: checks ?? [],
+    findings,
+    limitations,
+    nextActions: [...new Set(successes.flatMap(({ result }) => result.nextActions))],
+    incompleteSpecialists: failedRoles,
+    orchestrationError: reason,
+  };
 }
