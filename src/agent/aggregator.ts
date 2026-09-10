@@ -1,6 +1,6 @@
 import { createAgentSession, SessionManager } from "@earendil-works/pi-coding-agent";
 import type { CheckResult, Finding, MergePlan, ReviewResult } from "../types.js";
-import { validateReviewResult } from "../report.js";
+import { neutralizeInternalMarkers, validateReviewResult } from "../report.js";
 import { runSession } from "./session.js";
 import { boundedPreview } from "../tools/context.js";
 import { aggregatorPrompt } from "./prompts.js";
@@ -42,39 +42,46 @@ function findingRef(role: string, index: number): string {
  * 如果组装也读 payload，长文本会被 boundedPreview 静默截断，“按 ref 原样搬运”就不成立。
  */
 export function buildAggregatorPayload(successes: SpecialistResult[]): { payload: AggregatorPayloadItem[]; payloadChars: number; truncatedFindings: number; trimmedSections: number; refs: Set<string>; originals: Map<string, Finding> } {
-  const originals = new Map<string, Finding>(); // ref → 未被截断的专家原始 Finding，插入顺序即 payload 顺序。
-  const payload: AggregatorPayloadItem[] = successes.map(({ role, result }) => ({
-    role,
-    summary: boundedPreview(result.summary, 1_000),
-    // 只投影汇总需要的字段，并剔除原 id，避免模型混用 id 和 ref。
-    findings: result.findings.slice(0, 30).map((finding, index) => {
-      const ref = findingRef(role, index); // 当前 Finding 在汇总阶段、也是组装阶段使用的引用。
-      originals.set(ref, finding);
-      return {
-        ref,
-        severity: finding.severity,
-        category: finding.category,
-        title: boundedPreview(finding.title, 240),
-        summary: boundedPreview(finding.summary, 1_000),
-        location: finding.location,
-        evidence: finding.evidence.slice(0, 5).map((evidence) => ({ ...evidence, summary: boundedPreview(evidence.summary, 600) })),
-        confidence: finding.confidence,
-        suggestedFix: boundedPreview(finding.suggestedFix, 800),
-        verificationStatus: finding.verificationStatus,
-      };
-    }),
-    limitations: result.limitations.slice(0, 20).map((item) => boundedPreview(item, 500)),
-    nextActions: result.nextActions.slice(0, 20).map((item) => boundedPreview(item, 500)),
-  }));
-  const droppedByCap = successes.reduce((total, { result }) => total + Math.max(0, result.findings.length - 30), 0); // 每个专家超过 30 条的 Finding 同样不会进入报告。
+  const originals = new Map<string, Finding>(); // ref → 专家**全部**原始 Finding。阻断兜底必须看到完整集合，不能只看模型看得到的那部分。
+  const visibleRefs = new Set<string>(); // 模型实际看到的 ref 集合，只有这些可以被 keep 引用。
+  const payload: AggregatorPayloadItem[] = successes.map(({ role, result }) => {
+    // ref 基于完整列表的下标，因此“裁剪”不会改变其他 Finding 的 ref。
+    for (const [index, finding] of result.findings.entries()) originals.set(findingRef(role, index), finding);
+    return {
+      role,
+      summary: boundedPreview(result.summary, 1_000),
+      // 只投影汇总需要的字段，并剔除原 id，避免模型混用 id 和 ref。
+      findings: result.findings.slice(0, 30).map((finding, index) => {
+        const ref = findingRef(role, index); // 当前 Finding 在汇总阶段使用的引用。
+        visibleRefs.add(ref);
+        return {
+          ref,
+          severity: finding.severity,
+          category: finding.category,
+          title: boundedPreview(finding.title, 240),
+          summary: boundedPreview(finding.summary, 1_000),
+          location: finding.location,
+          evidence: finding.evidence.slice(0, 5).map((evidence) => ({ ...evidence, summary: boundedPreview(evidence.summary, 600) })),
+          confidence: finding.confidence,
+          suggestedFix: boundedPreview(finding.suggestedFix, 800),
+          verificationStatus: finding.verificationStatus,
+        };
+      }),
+      limitations: result.limitations.slice(0, 20).map((item) => boundedPreview(item, 500)),
+      nextActions: result.nextActions.slice(0, 20).map((item) => boundedPreview(item, 500)),
+    };
+  });
+  const droppedByCap = successes.reduce((total, { result }) => total + Math.max(0, result.findings.length - 30), 0); // 每个专家超过 30 条的 Finding 不会进入模型视野。
   let payloadChars = JSON.stringify(payload).length; // 汇总输入当前占用的字符数。
-  let truncatedFindings = droppedByCap; // 因超出下列限制而未进入报告的 Finding 数量。
+  let truncatedFindings = droppedByCap; // 未进入模型视野的 Finding 数量。
   let trimmedSections = 0; // 因超出预算而删除的说明/摘要数量。
   // 第一层：优先删除 Finding，而不是删除角色和限制信息；这样仍能保留失败语义。
   while (payloadChars > MAX_AGGREGATOR_CONTEXT_CHARS && payload.some((item) => item.findings.length > 0)) {
     const target = payload.reduce((current, item) => item.findings.length > current.findings.length ? item : current); // 找出 Finding 最多的专家，优先从它裁剪。
-    const removed = target.findings.pop(); // 被裁掉的投影项，它的 ref 也必须同步失效。
-    if (removed) originals.delete(removed.ref);
+    const removed = target.findings.pop(); // 被裁掉的投影项。
+    // 只从“模型可见集合”里移除：originals 保留有完整集合，
+    // 否则被裁掉的 high/critical 会连兜底逻辑都看不到，直接变成假通过。
+    if (removed) visibleRefs.delete(removed.ref);
     truncatedFindings += 1;
     payloadChars = JSON.stringify(payload).length;
   }
@@ -93,9 +100,9 @@ export function buildAggregatorPayload(successes: SpecialistResult[]): { payload
     trimmedSections += 1;
     payloadChars = JSON.stringify(payload).length;
   }
-  // ref 集合在裁剪之后统计，保证“模型可引用的 ref”与“可回查的原文”始终一致。
-  const refs = new Set(originals.keys());
-  return { payload, payloadChars, truncatedFindings, trimmedSections, refs, originals };
+  // refs 是“模型可引用的集合”，originals 是“可回查的完整集合”；
+  // 后者更大是故意的：被裁剪的阻断证据仍然要被兜底保留。
+  return { payload, payloadChars, truncatedFindings, trimmedSections, refs: visibleRefs, originals };
 }
 
 /** 组装最终结果所需的输入。 */
@@ -141,7 +148,8 @@ export function assembleMergedResult(input: MergeAssemblyInput): ReviewResult {
   }
   // 专家的 limitations/nextActions 记录的是“它没能验证什么”，属于不可丢失的事实；
   // 汇总 Prompt 已要求模型不要复述它们，因此必须由主控确定性合并，排在模型补充的全局信息之前。
-  const limitations = [...new Set([...input.specialists.flatMap(({ result }) => result.limitations), ...input.plan.limitations])];
+  // 专家的 limitations 同样是模型生成的文本，也要防止它们冒充内部标记。
+  const limitations = [...new Set([...input.specialists.flatMap(({ result }) => result.limitations.map(neutralizeInternalMarkers)), ...input.plan.limitations])];
   const nextActions = [...new Set([...input.specialists.flatMap(({ result }) => result.nextActions), ...input.plan.nextActions])];
   // 被裁掉的 Finding 不会进入报告，必须显式说明，否则读者会以为覆盖是完整的。
   if (input.truncatedFindings) limitations.unshift(`汇总输入超出 ${MAX_AGGREGATOR_CONTEXT_CHARS} 字符预算，${input.truncatedFindings} 条 Finding 未参与汇总，可能未出现在本报告中。`);
@@ -181,7 +189,7 @@ export async function runAggregatorAgent(input: MultiAgentRunInput, successes: S
   const plan = validateMergePlan(run.submitted, prepared.refs); // 已校验的汇总去重方案。
   const assembled = assembleMergedResult({ originals: prepared.originals, plan, checks: input.initialChecks ?? [], specialists: successes, truncatedFindings: prepared.truncatedFindings }); // 回查专家原文并按 ref 组装最终结果。
   const validated = validateReviewResult(assembled, input.initialChecks ?? [], input.context.changes.map((change) => change.path)); // 对组装结果做与专家一致的最终校验。
-  await input.trace.record("aggregator_merge_plan", { agentRole: "aggregator", totalRefs: prepared.refs.size, kept: plan.keep.length, dropped: prepared.refs.size - plan.keep.length, protectedBlockingRefs: blockingRefs(prepared.originals).filter((ref) => !plan.keep.includes(ref)).length });
+  await input.trace.record("aggregator_merge_plan", { agentRole: "aggregator", visibleRefs: prepared.refs.size, allFindings: prepared.originals.size, kept: plan.keep.length, dropped: prepared.refs.size - plan.keep.length, protectedBlockingRefs: blockingRefs(prepared.originals).filter((ref) => !plan.keep.includes(ref)).length });
   await input.trace.record("agent_end", { agentRole: "aggregator", findings: validated.findings.length, checks: validated.checks.length, telemetry: run.telemetry });
   return { ...validated, telemetry: run.telemetry };
 }

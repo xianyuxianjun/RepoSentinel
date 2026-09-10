@@ -6,11 +6,6 @@
       "required": true,
       "timeoutSeconds": 120
     },
-    "lint": {
-      "command": "npm run lint",
-      "required": false,
-      "timeoutSeconds": 120
-    },
     "typecheck": {
       "command": "npm run typecheck",
       "required": false,

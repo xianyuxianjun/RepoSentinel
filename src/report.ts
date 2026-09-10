@@ -118,6 +118,18 @@ function numberOr(value: unknown, fallback: number): number { return typeof valu
 function arrayOfStrings(value: unknown): string[] { return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : []; }
 function isRecommendation(value: unknown): value is Recommendation { return ["approve", "approve_with_notes", "needs_changes", "blocked", "inconclusive"].includes(String(value)); }
 
+// computeRecommendation 依据 limitation 前缀做确定性判定，模型提供的文本不能冒充这些内部标记。
+const INTERNAL_MARKERS = /^(agent_orchestration:|专家 Agent )/;
+
+/**
+ * 阻止模型生成的说明文本冒充内部标记。
+ * 专家和汇总的结果都会经过这里，否则受 diff 提示注入影响的模型可以直接操控
+ * 确定性结论（例如伪造 agent_orchestration 强制 inconclusive）。
+ */
+export function neutralizeInternalMarkers(value: string): string {
+  return INTERNAL_MARKERS.test(value) ? `汇总补充：${value}` : value;
+}
+
 /**
  * 重新计算最终建议，不信任模型自报的 mergeRecommendation。
  * 这是确定性安全门：模型只能提供证据，不能自行宣布“通过”。

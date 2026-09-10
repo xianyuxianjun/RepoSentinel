@@ -3,7 +3,7 @@ import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import type { CheckResult, GitContext, MergePlan, ReviewResult, SentinelConfig } from "../types.js";
 import { executeCheck, listChecks } from "../checks.js";
-import { validateReviewResult } from "../report.js";
+import { validateReviewResult, neutralizeInternalMarkers } from "../report.js";
 import { MAX_READ_LINE_NUMBER, readRepositoryFile, searchRepository } from "../files.js";
 import { getContextChunk, MAX_CONTEXT_PAGE_CHARS } from "./context.js";
 import { mergePlanSchema, reviewResultSchema } from "./schema.js";
@@ -146,8 +146,6 @@ export function createSubmitReviewTool(input: SubmitReviewToolContext, state: Re
  */
 const MAX_MERGE_NOTE_ITEMS = 20; // 汇总补充说明的条数上限，与汇总输入的限长保持一致。
 const MAX_MERGE_NOTE_CHARS = 500; // 单条汇总补充说明的长度上限。
-// computeRecommendation 依据 limitation 前缀做确定性判定，模型提供的文本不能冒充这些内部标记。
-const INTERNAL_MARKERS = /^(agent_orchestration:|专家 Agent )/;
 
 export function validateMergePlan(value: unknown, allowedRefs: ReadonlySet<string>): MergePlan {
   if (!value || typeof value !== "object") throw new Error("Merge plan 不是对象");
@@ -164,7 +162,7 @@ export function validateMergePlan(value: unknown, allowedRefs: ReadonlySet<strin
     const values = item.filter((entry): entry is string => typeof entry === "string");
     if (values.length > MAX_MERGE_NOTE_ITEMS) throw new Error(`Merge plan ${label} 不能超过 ${MAX_MERGE_NOTE_ITEMS} 条`);
     if (values.some((entry) => entry.length > MAX_MERGE_NOTE_CHARS)) throw new Error(`Merge plan ${label} 单条不能超过 ${MAX_MERGE_NOTE_CHARS} 字`);
-    return values.map((entry) => INTERNAL_MARKERS.test(entry) ? `汇总补充：${entry}` : entry);
+    return values.map(neutralizeInternalMarkers);
   };
   return { summary: plan.summary, keep, limitations: notes(plan.limitations, "limitations"), nextActions: notes(plan.nextActions, "nextActions") };
 }

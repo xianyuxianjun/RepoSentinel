@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { DEFAULT_CONFIG, DEFAULT_OPERATOR_CONFIG, validateConfig, validateOperatorConfig } from "../dist/config.js";
+import { DEFAULT_CONFIG, DEFAULT_OPERATOR_CONFIG, initConfig, loadOperatorConfig, validateConfig, validateOperatorConfig } from "../dist/config.js";
 import { resolveReviewModel } from "../dist/model-runtime.js";
 import { assertSafeCommand, isPathAllowed } from "../dist/policy.js";
 import { computeRecommendation, renderMarkdown, validateReviewResult } from "../dist/report.js";
@@ -468,6 +468,32 @@ test("counts findings dropped by the per-specialist cap", () => {
   assert.equal(prepared.refs.size, 30); // 每个专家最多投影 30 条。
   // 超出的 5 条不会进入报告，必须计入统计，否则读者会以为覆盖完整。
   assert.equal(prepared.truncatedFindings, 5);
+});
+
+test("protects blocking evidence that never entered the model's view", () => {
+  const lowFindings = [...Array(30)].map((_, index) => makeFinding(`finding_${index + 1}`, `low${index}`, { severity: "low" }));
+  const successes = [specialistSuccess("logic", lowFindings.concat([makeFinding("finding_31", "第 31 条才是阻断问题", { severity: "high" })]))];
+  const prepared = buildAggregatorPayload(successes);
+  assert.equal(prepared.refs.size, 30); // 模型看不到第 31 条。
+  // 但 originals 必须保留完整集合，否则裁掉的阻断证据连兜底逻辑都看不到，会变成假通过。
+  assert.equal(prepared.originals.size, 31);
+  assert.equal(prepared.originals.has("logic#31"), true);
+  const plan = validateMergePlan({ summary: "只保留一条", keep: ["logic#1"], limitations: [], nextActions: [] }, prepared.refs);
+  const merged = assembleMergedResult({ originals: prepared.originals, plan, checks: [], specialists: successes, truncatedFindings: prepared.truncatedFindings });
+  assert.deepEqual(merged.findings.map((finding) => finding.severity), ["low", "high"]);
+});
+
+test("does not silently fall back when an explicitly requested operator config is missing", async () => {
+  // 静默回退内置默认会让操作者以为自己换的模型生效了。
+  await assert.rejects(loadOperatorConfig("/nonexistent/repo-sentinel-operator.json"), /操作者配置不存在/);
+});
+
+test("init only writes checks whose npm script exists", async () => {
+  const repo = await mkdtemp(join(tmpdir(), "repo-sentinel-init-"));
+  await writeFile(join(repo, "package.json"), JSON.stringify({ name: "x", scripts: { test: "node --test", build: "tsc" } }));
+  const written = JSON.parse(await readFile(await initConfig(repo), "utf8"));
+  // 没有 lint/typecheck 脚本就不写这两个检查，否则每次审查都产生 environment_error 噪声。
+  assert.deepEqual(Object.keys(written.checks).sort(), ["build", "dependency", "test"]);
 });
 
 test("enforces the aggregator budget on summaries and notes, not only findings", () => {

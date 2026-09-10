@@ -30,7 +30,9 @@ export const DEFAULT_OPERATOR_CONFIG: OperatorConfig = { version: 1, model: DEFA
 
 /** 操作者配置的默认路径：与 Pi 自身的 agent 配置放在一起，位于被审查仓库之外。 */
 export function defaultOperatorConfigPath(): string {
-  const home = process.env.HOME ?? process.env.USERPROFILE ?? process.cwd(); // 当前用户的主目录。
+  const home = process.env.HOME ?? process.env.USERPROFILE; // 当前用户的主目录。
+  // 不回退到 cwd：cwd 往往就是被审查仓库，那等于把模型配置又交回 PR 控制。
+  if (!home) throw new Error("无法确定主目录（HOME/USERPROFILE 未设置）；请用 --operator-config 或 REPO_SENTINEL_OPERATOR_CONFIG 显式指定操作者配置");
   return join(home, ".pi", "agent", "repo-sentinel.json");
 }
 
@@ -73,11 +75,16 @@ export function validateOperatorConfig(input: unknown): OperatorConfig {
  * 但被审查仓库无法参与“用哪个模型、用什么提示词”这个选择。
  */
 export async function loadOperatorConfig(explicitPath?: string): Promise<{ config: OperatorConfig; path: string }> {
-  const path = resolve(explicitPath ?? process.env.REPO_SENTINEL_OPERATOR_CONFIG ?? defaultOperatorConfigPath()); // 显式参数优先，其次环境变量，最后默认路径。
+  const requested = explicitPath ?? process.env.REPO_SENTINEL_OPERATOR_CONFIG; // 调用方显式指定的路径。
+  const path = resolve(requested ?? defaultOperatorConfigPath());
   try {
     return { config: validateOperatorConfig(JSON.parse(await readFile(path, "utf8")) as unknown), path };
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { config: validateOperatorConfig(DEFAULT_OPERATOR_CONFIG), path };
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      // 显式指定却不存在必须报错：静默用内置默认会让操作者以为自己换的模型生效了。
+      if (requested) throw new Error(`操作者配置不存在：${path}`);
+      return { config: validateOperatorConfig(DEFAULT_OPERATOR_CONFIG), path };
+    }
     throw error;
   }
 }
@@ -223,6 +230,40 @@ export async function loadConfig(repoRoot: string, configPath?: string): Promise
   }
 }
 
+/**
+ * 从 npm 检查命令中取出它依赖的 package.json script；不依赖 script 的命令返回 undefined。
+ * npm 自带的 audit/install 等不是 script，不能当成缺失处理。
+ */
+function requiredScriptName(command: string): string | undefined {
+  const match = command.match(/^npm (?:run )?([a-z0-9:_-]+)(?:\s|$)/i); // 形如 npm test 或 npm run lint。
+  if (!match) return undefined;
+  const name = match[1];
+  return ["audit", "install", "ci", "ls", "outdated", "view", "config", "cache", "doctor"].includes(name) ? undefined : name;
+}
+
+/**
+ * 只保留仓库里真实存在的 npm script 检查。
+ * 否则 init 会生成一个永远跑不了的检查（如 npm run lint），每次审查都产生
+ * environment_error 噪声，还可能掩盖真正的 lint 问题。
+ */
+async function availableChecks(repoRoot: string): Promise<SentinelConfig["checks"]> {
+  let scripts: Record<string, string> = {}; // 目标仓库声明的 npm scripts。
+  try {
+    const manifest = JSON.parse(await readFile(join(repoRoot, "package.json"), "utf8")) as { scripts?: Record<string, string> };
+    scripts = manifest.scripts ?? {};
+  } catch {
+    return DEFAULT_CONFIG.checks; // 读不到 package.json 时不猜，保留默认检查交由执行阶段判定。
+  }
+  const checks: SentinelConfig["checks"] = {};
+  for (const [checkId, check] of Object.entries(DEFAULT_CONFIG.checks)) {
+    if (!check) continue;
+    const script = requiredScriptName(check.command); // 当前检查依赖的 script 名。
+    if (script && scripts[script] === undefined) continue;
+    checks[checkId as CheckCategory] = check;
+  }
+  return checks;
+}
+
 /** 创建示例配置；默认不覆盖已有配置，防止误删用户设置。 */
 export async function initConfig(repoRoot: string, force = false): Promise<string> {
   const path = resolve(repoRoot, ".repo-sentinel/config.json"); // 配置文件的绝对路径。
@@ -232,7 +273,8 @@ export async function initConfig(repoRoot: string, force = false): Promise<strin
     }
   }
   await mkdir(dirname(path), { recursive: true });
-  await writeFile(path, `${JSON.stringify(DEFAULT_CONFIG, null, 2)}\n`, "utf8");
+  // 按目标仓库实际存在的 npm script 生成检查，避免写入必然失败的检查。
+  await writeFile(path, `${JSON.stringify({ ...DEFAULT_CONFIG, checks: await availableChecks(repoRoot) }, null, 2)}\n`, "utf8");
   return path;
 }
 
