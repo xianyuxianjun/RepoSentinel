@@ -52,7 +52,7 @@
     "maxParallelAgents": 4,
     "maxSpecialistSeconds": 300,
     "maxAggregatorSeconds": 180,
-    "model": "deepseek/deepseek-v4-pro",
+    "model": "deepseek/deepseek-v4-flash",
     "roles": [
       {
         "id": "logic",

@@ -10,6 +10,7 @@ import { MAX_READ_LINE_NUMBER, MAX_READ_LINE_SPAN, readRepositoryFile, searchRep
 import { writeRun } from "../dist/report.js";
 import { executeCheck } from "../dist/checks.js";
 import { getContextChunk, runMultiAgentReview } from "../dist/agent.js";
+import { specialistPrompt } from "../dist/agent/prompts.js";
 import { assembleMergedResult, buildAggregatorPayload } from "../dist/agent/aggregator.js";
 import { validateMergePlan } from "../dist/tools/review.js";
 import { executeChecksOnce } from "../dist/review.js";
@@ -82,10 +83,10 @@ test("validates bounded multi-agent review settings", () => {
 });
 
 test("validates the configured review model reference", () => {
-  assert.equal(DEFAULT_CONFIG.review.model, "deepseek/deepseek-v4-pro");
-  assert.equal(validateConfig({ version: 1 }).review.model, "deepseek/deepseek-v4-pro");
+  assert.equal(DEFAULT_CONFIG.review.model, "deepseek/deepseek-v4-flash");
+  assert.equal(validateConfig({ version: 1 }).review.model, "deepseek/deepseek-v4-flash");
   assert.equal(validateConfig({ version: 1, review: { model: " gpt/gpt-5.6-terra " } }).review.model, "gpt/gpt-5.6-terra");
-  assert.equal(validateConfig({ version: 1, review: { model: "deepseek/deepseek-v4-pro:high" } }).review.model, "deepseek/deepseek-v4-pro:high");
+  assert.equal(validateConfig({ version: 1, review: { model: "deepseek/deepseek-v4-flash:high" } }).review.model, "deepseek/deepseek-v4-flash:high");
   assert.throws(() => validateConfig({ version: 1, review: { model: "" } }), /review\.model/);
   assert.throws(() => validateConfig({ version: 1, review: { model: "   " } }), /review\.model/);
   assert.throws(() => validateConfig({ version: 1, review: { model: "a".repeat(201) } }), /review\.model/);
@@ -266,9 +267,9 @@ test("runs specialist and aggregator orchestration through an injectable session
 
 test("forwards the resolved review model into every agent session", async () => {
   const seenOptions = []; // 每个 Session 实际收到的 createAgentSession 选项。
-  const fakeModel = { provider: "deepseek", id: "deepseek-v4-pro" };
+  const fakeModel = { provider: "deepseek", id: "deepseek-v4-flash" };
   const fakeRuntime = { name: "fake-runtime" };
-  const agentModel = { model: fakeModel, thinkingLevel: "high", modelRuntime: fakeRuntime, reference: "deepseek/deepseek-v4-pro" };
+  const agentModel = { model: fakeModel, thinkingLevel: "high", modelRuntime: fakeRuntime, reference: "deepseek/deepseek-v4-flash" };
   const createAgentSession = async (options) => {
     seenOptions.push(options);
     const submit = options.customTools.find((tool) => tool.name === "submit_review");
@@ -453,6 +454,13 @@ test("deduplicates duplicate findings end to end through the merge-plan tool", a
   assert.equal(result.findings[0].evidence.length, 1); // 证据由主控搬运，未经过模型转述。
   assert.equal(result.summary, "deduped");
   assert.deepEqual(aggregateTools, ["submit_merge_plan"]); // 汇总 Agent 不再拥有提交完整结果的工具。
+});
+
+test("injects the configured page size into the specialist prompt", () => {
+  const prompt = specialistPrompt({ role: "logic", instructions: "x", context: { base: {}, head: {}, changes: [] }, initialChecks: [] });
+  // 出现字面量说明 ${...} 被写在了普通字符串里，模型会照着假占位符传参。
+  assert.equal(prompt.includes("MAX_CONTEXT_PAGE_CHARS"), false);
+  assert.equal(prompt.includes("maxChars=32000"), true);
 });
 
 test("scores evaluation telemetry and latency through an injectable runner", async () => {  const dataset = await mkdtemp(join(tmpdir(), "repo-sentinel-eval-"));

@@ -11,7 +11,7 @@ RepoSentinel 是一个基于 Pi Agent SDK 的本地代码变更验证 Agent。�
 - Agent 只能按 `checkId` 运行预先配置的检查，不接受任意 Shell 命令。
 - Agent 可通过受控的 `read_file` / `search_files` 工具查看仓库源码；工具会校验仓库边界、符号链接和敏感路径。
 - 必要检查在 Agent 启动前确定性执行，模型不能通过遗漏检查伪造通过结论。
-- 默认使用 `deepseek/deepseek-v4-pro` 执行审查，可通过配置项 `review.model` 换成任意已认证的模型；解析失败会在创建 Session 前明确报错，不会静默回退到其他模型。
+- 默认使用 `deepseek/deepseek-v4-flash` 执行审查，可通过配置项 `review.model` 换成任意已认证的模型；解析失败会在创建 Session 前明确报错，不会静默回退到其他模型。
 - 默认使用 4 个专业 Agent 并发分工审查逻辑、测试、安全和工程质量，再由汇总 Agent 去重；汇总 Agent 只提交“保留哪些 Finding 的引用 + 摘要”，Finding 正文由主控按引用原样搬运，因此汇总阶段既不会篡改证据，也不受重新生成正文的输出量限制；角色和并行度均可配置（默认并发 4，可用 `review.maxParallelAgents` 降到 1 回到串行以兼容不支持并发流的 Provider），每个 Agent 都有独立轮次和时间上限。
 - 默认拒绝 dirty worktree、敏感路径、仓库外路径和源代码写操作。
 - 结论由确定性规则重算，模型不能自行宣布通过：必需的检查未完成、或某个专家 Agent 未完成时返回 `inconclusive`（无法完成验证）；已经拿到 `high`/`critical` 且 `verified` 的证据时优先返回 `needs_changes`，避免因为专家缺失而丢掉阻断结论。
@@ -72,7 +72,7 @@ repo-sentinel diagnose --repo /path/to/project
 
 配置文件为目标仓库下的 `.repo-sentinel/config.json`。检查命令必须使用 MVP 支持的预定义 npm 命令。默认不允许 Shell 管道、重定向、命令替换或网络工具。检查摘要会脱敏 token、密码、Bearer 凭据和 PEM 私钥。
 
-多 Agent 运行参数位于 `review`：`model`（默认 `deepseek/deepseek-v4-pro`）指定本次审查使用的模型，支持 `provider/modelId` 形式以及 `:thinkingLevel` 后缀（如 `deepseek/deepseek-v4-pro:high`）；`maxParallelAgents`（默认 4；Provider 有限流或串行化流式请求时调到 1）、`maxSpecialistSeconds`（默认 300）和 `maxAggregatorSeconds`（默认 180）分别限制并发数、单个专家和汇总 Agent 的运行时间；`maxAgentTurns`（默认 24）仍限制每个 Session 的轮次；它必须与 `maxDiffBytes` 和分页上限匹配，否则大 diff 会在读完之前耗尽轮次。
+多 Agent 运行参数位于 `review`：`model`（默认 `deepseek/deepseek-v4-flash`）指定本次审查使用的模型，支持 `provider/modelId` 形式以及 `:thinkingLevel` 后缀（如 `deepseek/deepseek-v4-flash:high`）；`maxParallelAgents`（默认 4；Provider 有限流或串行化流式请求时调到 1）、`maxSpecialistSeconds`（默认 300）和 `maxAggregatorSeconds`（默认 180）分别限制并发数、单个专家和汇总 Agent 的运行时间；`maxAgentTurns`（默认 24）仍限制每个 Session 的轮次；它必须与 `maxDiffBytes` 和分页上限匹配，否则大 diff 会在读完之前耗尽轮次。
 
 `review.model` 只接受 Pi 中已配置认证的模型（`~/.pi/agent/auth.json`）。解析失败会直接终止本次审查并写入报告，不会回退到其他模型。实际使用的 `provider/modelId` 和思考档位记录在 `run.json` 的 `agent` 字段和 `trace.jsonl` 的 `agent_model_resolved` 事件中。
 

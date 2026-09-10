@@ -43,7 +43,7 @@ export interface SentinelConfig {
     maxParallelAgents: number;
     maxSpecialistSeconds: number;
     maxAggregatorSeconds: number;
-    /** 模型引用，如 "deepseek/deepseek-v4-pro"，可带 ":high" 思考档位；缺省时使用内置默认模型。 */
+    /** 模型引用，如 "deepseek/deepseek-v4-flash"，可带 ":high" 思考档位；缺省时使用内置默认模型。 */
     model?: string;
     roles: AgentRoleConfig[];
   };

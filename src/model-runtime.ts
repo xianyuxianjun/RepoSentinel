@@ -10,7 +10,7 @@ import type { ScopedModel } from "@earendil-works/pi-coding-agent";
 export interface ResolvedReviewModel {
   /** SDK 解析出的模型对象，可直接传给 createAgentSession。 */
   model: ScopedModel["model"];
-  /** 模型引用中显式声明的思考档位（如 "deepseek/deepseek-v4-pro:high"）；未声明时为 undefined。 */
+  /** 模型引用中显式声明的思考档位（如 "deepseek/deepseek-v4-flash:high"）；未声明时为 undefined。 */
   thinkingLevel?: ScopedModel["thinkingLevel"];
   /** 解析出该模型的 Runtime；复用它可以避免每个 Session 重复加载模型目录。 */
   modelRuntime: ModelRuntime;

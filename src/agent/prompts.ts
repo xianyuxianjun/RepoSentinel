@@ -12,11 +12,16 @@ export function specialistPrompt(input: AgentRunInput): string {
   const checkInstruction = input.includeCheckTool === false
     ? "所有已启用检查已由主控程序执行过一次。不要调用 run_check；直接使用下面的检查摘要作为证据。"
     : "先使用 list_checks，再按需使用 run_check 获取证据。";
+  // 必须用模板字符串（反引号）：写在普通双引号字符串里的 ${...} 不会被求值，
+  // 模型会看到字面量 "${MAX_CONTEXT_PAGE_CHARS}" 而不是真实数字。
+  const contextInstruction = input.includeContextTools === false
+    ? "本角色采用快速模式，不再调用文件工具；仅依据变更清单和检查摘要提交结果。"
+    : `请先使用 get_change_context(offset=0, maxChars=${MAX_CONTEXT_PAGE_CHARS}) 分页读取 diff；如返回 nextOffset，继续读取后续分块，再使用 read_file/search_files 获取必要的非敏感上下文。每次尽量用满 maxChars（上限 ${MAX_CONTEXT_PAGE_CHARS}），以减少往返次数。`;
   return `You are RepoSentinel specialist agent: ${role}.
 
 你的职责：${input.instructions ?? "审查本次 Git 变更，识别有证据支持的问题。"}
 
-  首屏只提供变更清单和检查摘要，不嵌入完整 diff，以避免上下文截断。${input.includeContextTools === false ? "本角色采用快速模式，不再调用文件工具；仅依据变更清单和检查摘要提交结果。" : "请先使用 get_change_context(offset=0, maxChars=${MAX_CONTEXT_PAGE_CHARS}) 分页读取 diff；如返回 nextOffset，继续读取后续分块，再使用 read_file/search_files 获取必要的非敏感上下文。每次尽量用满 maxChars（上限 ${MAX_CONTEXT_PAGE_CHARS}），以减少往返次数。"}${checkInstruction}
+  首屏只提供变更清单和检查摘要，不嵌入完整 diff，以避免上下文截断。${contextInstruction}${checkInstruction}
 不要执行任意 Shell 命令，不要读取敏感路径，不要修改仓库文件。
 
 变更文件清单：
