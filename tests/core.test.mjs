@@ -496,6 +496,17 @@ test("init only writes checks whose npm script exists", async () => {
   assert.deepEqual(Object.keys(written.checks).sort(), ["build", "dependency", "test"]);
 });
 
+test("init keeps required checks even when their npm script is missing", async () => {
+  const repo = await mkdtemp(join(tmpdir(), "repo-sentinel-init-"));
+  await writeFile(join(repo, "package.json"), JSON.stringify({ name: "x", scripts: { build: "tsc" } }));
+  const written = JSON.parse(await readFile(await initConfig(repo), "utf8"));
+  // 非必需的 lint 可以丢（没有 lint 脚本），但必需的 test 必须保留：
+  // 缺脚本时它会以 environment_error 让结论变成 inconclusive，也就是 fail-closed；
+  // 把它删掉会让确定性门禁静默消失（fail-open）。
+  assert.equal("lint" in written.checks, false);
+  assert.equal(written.checks.test.required, true);
+});
+
 test("enforces the aggregator budget on summaries and notes, not only findings", () => {
   const note = "n".repeat(500);
   const longResult = (role) => ({ role, result: { schemaVersion: 1, summary: "s".repeat(1_000), checks: [], findings: [], limitations: Array(20).fill(note), nextActions: Array(20).fill(note) } });

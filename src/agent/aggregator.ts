@@ -210,6 +210,8 @@ export function mergeSpecialistResults(successes: SpecialistResult[], checks: Mu
       findings.push({ ...finding, id: `finding_${findings.length + 1}` });
     }
   }
-  const limitations = [...successes.flatMap(({ result }) => result.limitations), ...failedRoles.map((role) => `专家 Agent ${role} 未完成结构化审查。`), ...(reason ? [`agent_orchestration: ${reason}`] : [])]; // 合并专家限制和编排失败原因。
-  return { schemaVersion: 1, mergeRecommendation: reason ? "inconclusive" : "approve_with_notes", summary: `多 Agent 审查完成：${successes.length} 个专家 Agent 返回结果，合并 ${findings.length} 条去重 Finding。`, checks: checks ?? [], findings, limitations: [...new Set(limitations)], nextActions: [...new Set(successes.flatMap(({ result }) => result.nextActions))] };
+  const limitations = [...new Set([...successes.flatMap(({ result }) => result.limitations.map(neutralizeInternalMarkers)), ...failedRoles.map((role) => `专家 Agent ${role} 未完成结构化审查。`), ...(reason !== undefined ? [`agent_orchestration: ${reason}`] : [])])];
+  // reason 用 !== undefined 判断而不是真值：空字符串的 error message 会跳过这条标记，
+  // 让一次降级结果看起来像正常合并（fail-open）。
+  return { schemaVersion: 1, mergeRecommendation: reason !== undefined ? "inconclusive" : "approve_with_notes", summary: `多 Agent 审查完成：${successes.length} 个专家 Agent 返回结果，合并 ${findings.length} 条去重 Finding。`, checks: checks ?? [], findings, limitations, nextActions: [...new Set(successes.flatMap(({ result }) => result.nextActions))] };
 }

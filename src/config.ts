@@ -242,9 +242,11 @@ function requiredScriptName(command: string): string | undefined {
 }
 
 /**
- * 只保留仓库里真实存在的 npm script 检查。
- * 否则 init 会生成一个永远跑不了的检查（如 npm run lint），每次审查都产生
- * environment_error 噪声，还可能掩盖真正的 lint 问题。
+ * 按目标仓库实际存在的 npm script 收敛检查。
+ *
+ * 只丢掉“非必需且脚本不存在”的检查（如本仓库没有 lint）：它们只会制造噪声。
+ * 必需检查即使脚本缺失也保留——此时它会以 environment_error 让结论变成
+ * inconclusive，也就是 fail-closed；删掉它反而会让确定性门禁静默消失。
  */
 async function availableChecks(repoRoot: string): Promise<SentinelConfig["checks"]> {
   let scripts: Record<string, string> = {}; // 目标仓库声明的 npm scripts。
@@ -258,7 +260,7 @@ async function availableChecks(repoRoot: string): Promise<SentinelConfig["checks
   for (const [checkId, check] of Object.entries(DEFAULT_CONFIG.checks)) {
     if (!check) continue;
     const script = requiredScriptName(check.command); // 当前检查依赖的 script 名。
-    if (script && scripts[script] === undefined) continue;
+    if (script && scripts[script] === undefined && check.required !== true) continue;
     checks[checkId as CheckCategory] = check;
   }
   return checks;

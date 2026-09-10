@@ -85,16 +85,18 @@ export async function runReview(options: ReviewOptions): Promise<{ result: Revie
   } else {
     let executedChecks: CheckResult[] = []; // 主控已经执行过的检查结果。
     try {
+      // 先跑确定性检查：即使模型配置或认证有问题，报告也应该保留检查证据，
+      // 否则一次模型故障会把已经获得的测试/构建结论一并丢掉。
+      // 主控统一执行检查，专家只消费结果，避免多个 Agent 重复运行 npm 命令。
+      const enabledChecks = listChecks(config); // 当前配置中启用的检查列表。
+      executedChecks = await executeChecksOnce(repositoryRoot, config, enabledChecks.map(({ checkId }) => checkId));
+      for (const check of executedChecks) await trace.record("check_result", check as unknown as Record<string, unknown>);
       // 模型与提示词来自操作者配置，而不是被审查仓库的配置：
       // 后者随 PR 变更，不能用来决定审查成本和数据出向。
       const operator = await loadOperatorConfig(options.operatorConfigPath); // 操作者配置及其路径。
       operatorPath = operator.path;
       agentModel = await resolveReviewModel(operator.config.model, { thinkingLevel: operator.config.thinkingLevel });
       await trace.record("agent_model_resolved", { model: agentModel.reference, thinkingLevel: agentModel.thinkingLevel, operatorConfigPath: operator.path, rolePrompts: Object.keys(operator.config.rolePrompts ?? {}), aggregatorPromptOverridden: operator.config.aggregatorPrompt !== undefined });
-      // 主控统一执行检查，专家只消费结果，避免多个 Agent 重复运行 npm 命令。
-      const enabledChecks = listChecks(config); // 当前配置中启用的检查列表。
-      executedChecks = await executeChecksOnce(repositoryRoot, config, enabledChecks.map(({ checkId }) => checkId));
-      for (const check of executedChecks) await trace.record("check_result", check as unknown as Record<string, unknown>);
       result = await runMultiAgentReview({
         repositoryRoot,
         context,
