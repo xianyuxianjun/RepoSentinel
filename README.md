@@ -72,7 +72,7 @@ repo-sentinel diagnose --repo /path/to/project
 
 配置文件为目标仓库下的 `.repo-sentinel/config.json`。检查命令必须使用 MVP 支持的预定义 npm 命令。默认不允许 Shell 管道、重定向、命令替换或网络工具。检查摘要会脱敏 token、密码、Bearer 凭据和 PEM 私钥。
 
-多 Agent 运行参数位于 `review`：`model`（默认 `deepseek/deepseek-v4-flash`）指定本次审查使用的模型，支持 `provider/modelId` 形式以及 `:thinkingLevel` 后缀（如 `deepseek/deepseek-v4-flash:high`）；`maxParallelAgents`（默认 4；Provider 有限流或串行化流式请求时调到 1）、`maxSpecialistSeconds`（默认 300）和 `maxAggregatorSeconds`（默认 180）分别限制并发数、单个专家和汇总 Agent 的运行时间；`maxAgentTurns`（默认 24）仍限制每个 Session 的轮次；它必须与 `maxDiffBytes` 和分页上限匹配，否则大 diff 会在读完之前耗尽轮次。
+多 Agent 运行参数位于 `review`：`model`（默认 `deepseek/deepseek-v4-flash`）指定本次审查使用的模型，支持 `provider/modelId` 形式以及 `:thinkingLevel` 后缀（如 `deepseek/deepseek-v4-flash:high`）；`maxParallelAgents`（默认 4；Provider 有限流或串行化流式请求时调到 1）、`maxSpecialistSeconds`（默认 300）和 `maxAggregatorSeconds`（默认 180）分别限制并发数、单个专家和汇总 Agent 的运行时间；`maxAgentTurns`（默认 40）仍限制每个 Session 的轮次；它既要和 `maxDiffBytes` 与分页上限匹配，也取决于所选模型的话多少——实测同样 diff 下 flash 的工具调用次数约为 pro 的两倍，换模型后应重新核对。
 
 `review.model` 只接受 Pi 中已配置认证的模型（`~/.pi/agent/auth.json`）。解析失败会直接终止本次审查并写入报告，不会回退到其他模型。实际使用的 `provider/modelId` 和思考档位记录在 `run.json` 的 `agent` 字段和 `trace.jsonl` 的 `agent_model_resolved` 事件中。
 
