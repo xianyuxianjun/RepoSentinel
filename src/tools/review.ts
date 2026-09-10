@@ -5,7 +5,7 @@ import type { CheckResult, GitContext, MergePlan, ReviewResult, SentinelConfig }
 import { executeCheck, listChecks } from "../checks.js";
 import { validateReviewResult } from "../report.js";
 import { MAX_READ_LINE_NUMBER, readRepositoryFile, searchRepository } from "../files.js";
-import { getContextChunk } from "./context.js";
+import { getContextChunk, MAX_CONTEXT_PAGE_CHARS } from "./context.js";
 import { mergePlanSchema, reviewResultSchema } from "./schema.js";
 import { TraceRecorder } from "../trace.js";
 
@@ -58,7 +58,7 @@ export function createSpecialistTools(input: ReviewToolContext, state: ReviewToo
   const getContext = defineTool({
     name: "get_change_context", label: "Get Change Context", description: "Read one bounded page of the Git change context for this review.",
     promptSnippet: "Read the Git diff in bounded pages; continue from nextOffset when present.",
-    parameters: Type.Object({ offset: Type.Optional(Type.Integer({ minimum: 0 })), maxChars: Type.Optional(Type.Integer({ minimum: 1, maximum: 12_000 })) }),
+    parameters: Type.Object({ offset: Type.Optional(Type.Integer({ minimum: 0 })), maxChars: Type.Optional(Type.Integer({ minimum: 1, maximum: MAX_CONTEXT_PAGE_CHARS })) }),
     execute: async (_id, params) => {
       const value = params as { offset?: number; maxChars?: number }; // Tool 参数经过 schema 后的类型视图。
       const chunk = getContextChunk(input.context, value.offset, value.maxChars); // 读取一页受限 Diff。

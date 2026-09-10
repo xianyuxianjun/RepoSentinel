@@ -356,9 +356,9 @@ test("assembles merged findings by ref without re-emitting their bodies", () => 
     specialistSuccess("logic", [makeFinding("finding_1", "负索引切片"), makeFinding("finding_2", "仅按空格分词")]),
     specialistSuccess("quality", [makeFinding("finding_1", "负索引切片（重复）")]),
   ];
-  const { payload, refs } = buildAggregatorPayload(successes);
+  const { originals, refs } = buildAggregatorPayload(successes);
   const plan = validateMergePlan({ summary: "合并结论", keep: ["logic#1", "logic#2"], limitations: ["限制"], nextActions: ["动作"] }, refs);
-  const merged = assembleMergedResult(payload, plan, []);
+  const merged = assembleMergedResult({ originals, plan, checks: [], specialists: successes });
   // 保留两条、丢弃 quality 的重复项，且正文必须与专家原文一致（模型没有机会改写证据）。
   assert.deepEqual(merged.findings.map((finding) => finding.id), ["finding_1", "finding_2"]);
   assert.deepEqual(merged.findings.map((finding) => finding.title), ["负索引切片", "仅按空格分词"]);
@@ -367,6 +367,30 @@ test("assembles merged findings by ref without re-emitting their bodies", () => 
   assert.equal(merged.findings[0].location.path, "src/a.ts");
   assert.equal("ref" in merged.findings[0], false);
   assert.equal(merged.summary, "合并结论");
+});
+
+test("assembles findings from the original specialist result instead of the bounded aggregator input", () => {
+  const longSummary = "S".repeat(3_000); // 超过汇总输入对 summary 的 1,000 字限长。
+  const successes = [specialistSuccess("logic", [makeFinding("finding_1", "长文本问题", { summary: longSummary })])];
+  const { originals, refs } = buildAggregatorPayload(successes);
+  const plan = validateMergePlan({ summary: "合并结论", keep: ["logic#1"], limitations: [], nextActions: [] }, refs);
+  const merged = assembleMergedResult({ originals, plan, checks: [], specialists: successes });
+  // 汇总输入会被限长用于控制 Prompt 体积，但最终报告必须回查专家原文，不能被静默截断。
+  assert.equal(merged.findings[0].summary, longSummary);
+  assert.equal(merged.findings[0].summary.includes("preview truncated"), false);
+});
+
+test("keeps specialist limitations and next actions alongside the aggregator summary", () => {
+  const successes = [
+    { role: "logic", result: { schemaVersion: 1, summary: "", checks: [], findings: [makeFinding("finding_1", "a")], limitations: ["无法验证运行时行为"], nextActions: ["补充集成测试"] } },
+    { role: "testing", result: { schemaVersion: 1, summary: "", checks: [], findings: [makeFinding("finding_1", "b")], limitations: ["未执行 lint"], nextActions: ["补充集成测试"] } },
+  ];
+  const { originals, refs } = buildAggregatorPayload(successes);
+  const plan = validateMergePlan({ summary: "s", keep: ["logic#1", "testing#1"], limitations: ["全局：依赖审计不可用"], nextActions: ["修复后重跑"] }, refs);
+  const merged = assembleMergedResult({ originals, plan, checks: [], specialists: successes });
+  // 专家说的“我无法验证什么”属于不可丢失的事实，必须排在模型补充的全局信息之前，并去重。
+  assert.deepEqual(merged.limitations, ["无法验证运行时行为", "未执行 lint", "全局：依赖审计不可用"]);
+  assert.deepEqual(merged.nextActions, ["补充集成测试", "修复后重跑"]);
 });
 
 test("rejects merge plans that invent refs, drop every finding, or exceed the summary budget", () => {
@@ -530,7 +554,9 @@ test("serves bounded diff chunks with a continuation offset", () => {
   const last = getContextChunk(context, second.nextOffset, 8);
   assert.equal(last.diff, "ghij");
   assert.equal(last.nextOffset, undefined);
-  assert.equal(getContextChunk(context, 0, 99999).limit, 12000);
+  assert.equal(getContextChunk(context, 0, 99999).limit, 32000);
+  // 未传 maxChars 时默认用满上限，避免用更多轮次换同样的内容。
+  assert.equal(getContextChunk(context, 0).limit, 32000);
 });
 
 test("bounds repository file reads before decoding content", async () => {

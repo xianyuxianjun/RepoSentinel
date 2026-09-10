@@ -18,7 +18,7 @@ RepoSentinel 是一个基于 Pi Agent SDK 的本地代码变更验证 Agent。�
 - 输出 `run.json`、`report.md`、`report.sarif`、`checks.json` 和 `trace.jsonl`；SARIF 可被 GitHub Code Scanning 等工具消费。
 - `run.json` 和 Trace 汇总 Agent 轮次、工具调用、输入/输出 token、缓存 token、成本及时延；无法从 Provider 取得的 usage 按 0 记录并以 `usageAvailable`/`telemetryAvailableCases` 区分。
 - 敏感路径基线（`.env`、密钥/证书和 `.git`）始终拒绝访问，`denyPathPatterns` 只能追加规则，不能清空或覆盖基线。
-- 采用分层上下文：首屏只注入变更清单和限长检查摘要，Diff 通过 `get_change_context(offset, maxChars)` 分页读取；每次分块读取写入 `context_chunk_read` Trace，避免大变更一次性截断。
+- 采用分层上下文：首屏只注入变更清单和限长检查摘要，Diff 通过 `get_change_context(offset, maxChars)` 分页读取；每次分块读取写入 `context_chunk_read` Trace，避免大变更一次性截断。单页上限 32,000 字符且默认用满上限，让 Agent 用尽量少的轮次读完 diff（页太小会把轮次预算耗在翻页上，而不是用于提交结论）。
 - 汇总阶段同样设有输入预算：每个专家最多传入 30 条 Finding，长文本和证据摘要做限长处理，并记录 `aggregator_context_bounded` Trace。每条 Finding 在汇总输入里获得一个稳定的 `ref`（形如 `logic#2`），汇总方案只能引用这些 ref；模型引用了不存在的 ref、或把所有 Finding 都丢掉时会被工具拒绝并要求重新提交。保留决定记录在 `aggregator_merge_plan` Trace 中，可审计去重结果。
 
 ## 安装
@@ -72,7 +72,7 @@ repo-sentinel diagnose --repo /path/to/project
 
 配置文件为目标仓库下的 `.repo-sentinel/config.json`。检查命令必须使用 MVP 支持的预定义 npm 命令。默认不允许 Shell 管道、重定向、命令替换或网络工具。检查摘要会脱敏 token、密码、Bearer 凭据和 PEM 私钥。
 
-多 Agent 运行参数位于 `review`：`model`（默认 `deepseek/deepseek-v4-pro`）指定本次审查使用的模型，支持 `provider/modelId` 形式以及 `:thinkingLevel` 后缀（如 `deepseek/deepseek-v4-pro:high`）；`maxParallelAgents`（默认 4；Provider 有限流或串行化流式请求时调到 1）、`maxSpecialistSeconds`（默认 300）和 `maxAggregatorSeconds`（默认 180）分别限制并发数、单个专家和汇总 Agent 的运行时间；`maxAgentTurns` 仍限制每个 Session 的轮次。
+多 Agent 运行参数位于 `review`：`model`（默认 `deepseek/deepseek-v4-pro`）指定本次审查使用的模型，支持 `provider/modelId` 形式以及 `:thinkingLevel` 后缀（如 `deepseek/deepseek-v4-pro:high`）；`maxParallelAgents`（默认 4；Provider 有限流或串行化流式请求时调到 1）、`maxSpecialistSeconds`（默认 300）和 `maxAggregatorSeconds`（默认 180）分别限制并发数、单个专家和汇总 Agent 的运行时间；`maxAgentTurns`（默认 24）仍限制每个 Session 的轮次；它必须与 `maxDiffBytes` 和分页上限匹配，否则大 diff 会在读完之前耗尽轮次。
 
 `review.model` 只接受 Pi 中已配置认证的模型（`~/.pi/agent/auth.json`）。解析失败会直接终止本次审查并写入报告，不会回退到其他模型。实际使用的 `provider/modelId` 和思考档位记录在 `run.json` 的 `agent` 字段和 `trace.jsonl` 的 `agent_model_resolved` 事件中。
 

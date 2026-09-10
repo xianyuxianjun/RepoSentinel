@@ -47,7 +47,7 @@
   "review": {
     "maxChangedFiles": 80,
     "maxDiffBytes": 500000,
-    "maxAgentTurns": 12,
+    "maxAgentTurns": 24,
     "maxAgentSeconds": 600,
     "maxParallelAgents": 4,
     "maxSpecialistSeconds": 300,

@@ -45,7 +45,9 @@ export const DEFAULT_CONFIG: SentinelConfig = {
   review: {
     maxChangedFiles: 80,
     maxDiffBytes: 500_000,
-    maxAgentTurns: 12,
+    maxAgentTurns: 24,
+    // 轮次预算必须和分页上限一致：500,000 字节的 diff 按 32,000 字符分页约 16 页，
+    // 再加上读文件和提交的轮次，24 轮才能覆盖配置允许的最大 diff。
     maxAgentSeconds: 600,
     // 默认按“推理模型 + 长 Prompt”标定：实测 deepseek-v4-pro 单个专家约 60-95 秒，
     // 最重的 testing 角色（10-13 次工具调用）在并发争用下会超过 180 秒，因此专家上限留到 300 秒；

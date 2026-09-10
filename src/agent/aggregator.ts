@@ -34,25 +34,34 @@ function findingRef(role: string, index: number): string {
 
 /**
  * 为汇总 Agent 构造最小必要信息。
- * 每层都有限制：专家数量、Finding 数量、文本长度和总字符数。
+ *
+ * 这里返回两套东西，它们服务不同目的，不能混用：
+ * - payload：给模型看的**限长投影**，受 MAX_AGGREGATOR_CONTEXT_CHARS 预算约束；
+ * - originals：ref → 专家**原始 Finding**，用于组装最终报告。
+ * 如果组装也读 payload，长文本会被 boundedPreview 静默截断，“按 ref 原样搬运”就不成立。
  */
-export function buildAggregatorPayload(successes: SpecialistResult[]): { payload: AggregatorPayloadItem[]; payloadChars: number; truncatedFindings: number; refs: Set<string> } {
+export function buildAggregatorPayload(successes: SpecialistResult[]): { payload: AggregatorPayloadItem[]; payloadChars: number; truncatedFindings: number; refs: Set<string>; originals: Map<string, Finding> } {
+  const originals = new Map<string, Finding>(); // ref → 未被截断的专家原始 Finding，插入顺序即 payload 顺序。
   const payload: AggregatorPayloadItem[] = successes.map(({ role, result }) => ({
     role,
     summary: boundedPreview(result.summary, 1_000),
     // 只投影汇总需要的字段，并剔除原 id，避免模型混用 id 和 ref。
-    findings: result.findings.slice(0, 30).map((finding, index) => ({
-      ref: findingRef(role, index),
-      severity: finding.severity,
-      category: finding.category,
-      title: boundedPreview(finding.title, 240),
-      summary: boundedPreview(finding.summary, 1_000),
-      location: finding.location,
-      evidence: finding.evidence.slice(0, 5).map((evidence) => ({ ...evidence, summary: boundedPreview(evidence.summary, 600) })),
-      confidence: finding.confidence,
-      suggestedFix: boundedPreview(finding.suggestedFix, 800),
-      verificationStatus: finding.verificationStatus,
-    })),
+    findings: result.findings.slice(0, 30).map((finding, index) => {
+      const ref = findingRef(role, index); // 当前 Finding 在汇总阶段、也是组装阶段使用的引用。
+      originals.set(ref, finding);
+      return {
+        ref,
+        severity: finding.severity,
+        category: finding.category,
+        title: boundedPreview(finding.title, 240),
+        summary: boundedPreview(finding.summary, 1_000),
+        location: finding.location,
+        evidence: finding.evidence.slice(0, 5).map((evidence) => ({ ...evidence, summary: boundedPreview(evidence.summary, 600) })),
+        confidence: finding.confidence,
+        suggestedFix: boundedPreview(finding.suggestedFix, 800),
+        verificationStatus: finding.verificationStatus,
+      };
+    }),
     limitations: result.limitations.slice(0, 20).map((item) => boundedPreview(item, 500)),
     nextActions: result.nextActions.slice(0, 20).map((item) => boundedPreview(item, 500)),
   }));
@@ -61,40 +70,52 @@ export function buildAggregatorPayload(successes: SpecialistResult[]): { payload
   // 超预算时优先删除 Finding，而不是删除角色和限制信息；这样仍能保留失败语义。
   while (payloadChars > MAX_AGGREGATOR_CONTEXT_CHARS && payload.some((item) => item.findings.length > 0)) {
     const target = payload.reduce((current, item) => item.findings.length > current.findings.length ? item : current); // 找出 Finding 最多的专家，优先从它裁剪。
-    target.findings.pop();
+    const removed = target.findings.pop(); // 被裁掉的投影项，它的 ref 也必须同步失效。
+    if (removed) originals.delete(removed.ref);
     truncatedFindings += 1;
     payloadChars = JSON.stringify(payload).length;
   }
-  // ref 集合在裁剪之后统计，保证模型能引用的 ref 和它看到的输入完全一致。
-  const refs = new Set(payload.flatMap((item) => item.findings.map((finding) => finding.ref)));
-  return { payload, payloadChars, truncatedFindings, refs };
+  // ref 集合在裁剪之后统计，保证“模型可引用的 ref”与“可回查的原文”始终一致。
+  const refs = new Set(originals.keys());
+  return { payload, payloadChars, truncatedFindings, refs, originals };
+}
+
+/** 组装最终结果所需的输入。 */
+export interface MergeAssemblyInput {
+  /** ref → 专家原始 Finding，顺序与汇总输入一致。 */
+  originals: ReadonlyMap<string, Finding>;
+  plan: MergePlan;
+  checks: CheckResult[];
+  /** 成功提交结果的专家，用于确定性合并 limitations/nextActions。 */
+  specialists: SpecialistResult[];
 }
 
 /**
  * 按汇总方案组装最终结果。
  *
- * Finding 正文一律从专家原始结果搬运，模型只提供 keep 列表和摘要，
- * 因此汇总阶段既不会改写证据，也不需要重新生成数万 token 的正文。
+ * Finding 正文一律回查 originals 里的专家原文，模型只提供 keep 列表和摘要，
+ * 因此汇总阶段既不会改写证据，也不会被汇总输入的限长投影截断。
  */
-export function assembleMergedResult(payload: AggregatorPayloadItem[], plan: MergePlan, checks: CheckResult[]): ReviewResult {
-  const keep = new Set(plan.keep); // 模型决定保留的 Finding 引用。
+export function assembleMergedResult(input: MergeAssemblyInput): ReviewResult {
+  const keep = new Set(input.plan.keep); // 模型决定保留的 Finding 引用。
   const findings: Finding[] = []; // 按汇总输入顺序组装的最终 Finding 列表。
-  // 按输入顺序而不是 keep 顺序输出，保证同一份专家结果在不同运行里顺序稳定。
-  for (const item of payload) {
-    for (const finding of item.findings) {
-      if (!keep.has(finding.ref)) continue;
-      const { ref: _ref, ...rest } = finding; // ref 只用于汇总阶段，不进入最终报告。
-      findings.push({ ...rest, id: `finding_${findings.length + 1}` });
-    }
+  // 遍历 originals 而不是 keep，顺序才稳定；Map 的插入顺序就是专家结果的先后顺序。
+  for (const [ref, original] of input.originals) {
+    if (!keep.has(ref)) continue;
+    findings.push({ ...original, id: `finding_${findings.length + 1}` });
   }
+  // 专家的 limitations/nextActions 记录的是“它没能验证什么”，属于不可丢失的事实；
+  // 汇总 Prompt 已要求模型不要复述它们，因此必须由主控确定性合并，排在模型补充的全局信息之前。
+  const limitations = [...new Set([...input.specialists.flatMap(({ result }) => result.limitations), ...input.plan.limitations])];
+  const nextActions = [...new Set([...input.specialists.flatMap(({ result }) => result.nextActions), ...input.plan.nextActions])];
   return {
     schemaVersion: 1,
     mergeRecommendation: "inconclusive", // 占位值，由 computeRecommendation 在编排层重新计算。
-    summary: plan.summary,
-    checks,
+    summary: input.plan.summary,
+    checks: input.checks,
     findings,
-    limitations: plan.limitations,
-    nextActions: plan.nextActions,
+    limitations,
+    nextActions,
   };
 }
 
@@ -120,7 +141,7 @@ export async function runAggregatorAgent(input: MultiAgentRunInput, successes: S
   const run = await runSession({ session, trace: input.trace, role: "aggregator", maxTurns: input.maxTurns ?? 12, maxSeconds: input.aggregatorSeconds ?? input.maxSeconds ?? 90, submitToolName: "submit_merge_plan" }, aggregatorPrompt(prepared.payload, failedRoles), () => state.submitted); // 执行汇总 Prompt 和提交工具。
   // 工具层已经校验过一次；这里再校验一次，作为不依赖工具实现的可信边界。
   const plan = validateMergePlan(run.submitted, prepared.refs); // 已校验的汇总去重方案。
-  const assembled = assembleMergedResult(prepared.payload, plan, input.initialChecks ?? []); // 按 ref 搬运正文并组装最终结果。
+  const assembled = assembleMergedResult({ originals: prepared.originals, plan, checks: input.initialChecks ?? [], specialists: successes }); // 回查专家原文并按 ref 组装最终结果。
   const validated = validateReviewResult(assembled, input.initialChecks ?? [], input.context.changes.map((change) => change.path)); // 对组装结果做与专家一致的最终校验。
   await input.trace.record("aggregator_merge_plan", { agentRole: "aggregator", totalRefs: prepared.refs.size, kept: plan.keep.length, dropped: prepared.refs.size - plan.keep.length });
   await input.trace.record("agent_end", { agentRole: "aggregator", findings: validated.findings.length, checks: validated.checks.length, telemetry: run.telemetry });

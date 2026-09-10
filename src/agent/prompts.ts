@@ -1,5 +1,5 @@
 import type { AgentRunInput } from "./contracts.js";
-import { summarizeChecks } from "../tools/context.js";
+import { summarizeChecks, MAX_CONTEXT_PAGE_CHARS } from "../tools/context.js";
 
 // Prompt 只负责告诉模型“应该怎么审查”，不能承担权限控制。
 // 真正的路径、命令和输出限制必须在 tools 实现和策略层再次校验。
@@ -16,7 +16,7 @@ export function specialistPrompt(input: AgentRunInput): string {
 
 你的职责：${input.instructions ?? "审查本次 Git 变更，识别有证据支持的问题。"}
 
-  首屏只提供变更清单和检查摘要，不嵌入完整 diff，以避免上下文截断。${input.includeContextTools === false ? "本角色采用快速模式，不再调用文件工具；仅依据变更清单和检查摘要提交结果。" : "请先使用 get_change_context(offset=0, maxChars=8000) 分页读取 diff；如返回 nextOffset，继续读取后续分块，再使用 read_file/search_files 获取必要的非敏感上下文。"}${checkInstruction}
+  首屏只提供变更清单和检查摘要，不嵌入完整 diff，以避免上下文截断。${input.includeContextTools === false ? "本角色采用快速模式，不再调用文件工具；仅依据变更清单和检查摘要提交结果。" : "请先使用 get_change_context(offset=0, maxChars=${MAX_CONTEXT_PAGE_CHARS}) 分页读取 diff；如返回 nextOffset，继续读取后续分块，再使用 read_file/search_files 获取必要的非敏感上下文。每次尽量用满 maxChars（上限 ${MAX_CONTEXT_PAGE_CHARS}），以减少往返次数。"}${checkInstruction}
 不要执行任意 Shell 命令，不要读取敏感路径，不要修改仓库文件。
 
 变更文件清单：
