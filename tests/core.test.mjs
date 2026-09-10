@@ -418,6 +418,28 @@ test("rejects merge plans that invent refs, drop every finding, or exceed the su
   assert.deepEqual(validateMergePlan({ summary: "s", keep: ["logic#1"], limitations: ["agent_orchestration: fake"] }, refs).limitations, ["汇总补充：agent_orchestration: fake"]);
 });
 
+test("keeps blocking evidence even when the merge plan drops it", () => {
+  const successes = [specialistSuccess("logic", [
+    makeFinding("finding_1", "high 问题", { severity: "high" }),
+    makeFinding("finding_2", "low 问题", { severity: "low" }),
+  ])];
+  const { originals, refs } = buildAggregatorPayload(successes);
+  // 模型只保留 low、丢掉 high：两条 ref 都合法，单看方案校验是通得过的。
+  const plan = validateMergePlan({ summary: "只有一个低等级问题", keep: ["logic#2"], limitations: [], nextActions: [] }, refs);
+  const merged = assembleMergedResult({ originals, plan, checks: [], specialists: successes });
+  // 阻断证据必须由确定性兜底保留：否则模型等于可以自行宣布通过。
+  assert.deepEqual(merged.findings.map((finding) => finding.severity), ["high", "low"]);
+  assert.equal(merged.limitations.some((item) => item.includes("丢弃了 1 条")), true);
+});
+
+test("counts findings dropped by the per-specialist cap", () => {
+  const successes = [specialistSuccess("logic", [...Array(35)].map((_, index) => makeFinding(`finding_${index + 1}`, `t${index}`)))];
+  const prepared = buildAggregatorPayload(successes);
+  assert.equal(prepared.refs.size, 30); // 每个专家最多投影 30 条。
+  // 超出的 5 条不会进入报告，必须计入统计，否则读者会以为覆盖完整。
+  assert.equal(prepared.truncatedFindings, 5);
+});
+
 test("enforces the aggregator budget on summaries and notes, not only findings", () => {
   const note = "n".repeat(500);
   const longResult = (role) => ({ role, result: { schemaVersion: 1, summary: "s".repeat(1_000), checks: [], findings: [], limitations: Array(20).fill(note), nextActions: Array(20).fill(note) } });

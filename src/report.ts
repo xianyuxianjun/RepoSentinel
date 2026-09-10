@@ -123,16 +123,17 @@ function isRecommendation(value: unknown): value is Recommendation { return ["ap
  * 这是确定性安全门：模型只能提供证据，不能自行宣布“通过”。
  */
 export function computeRecommendation(result: Omit<ReviewResult, "mergeRecommendation">, config: SentinelConfig): Recommendation {
+  // 第一优先：已经拿到的确定性阻断证据。只要存在 high/critical+verified，就给出可操作的
+  // 阻断结论，而不是因为检查未完成或编排不完整降级成“无法确认”而丢掉已发现的问题。
+  if (result.findings.some((finding) => (finding.severity === "critical" || finding.severity === "high") && finding.verificationStatus === "verified")) return "needs_changes";
   const requiredCheckIds = Object.entries(config.checks) // 所有必须成功完成的检查 ID。
     .filter(([, check]) => Boolean(check && check.enabled !== false && check.required))
     .map(([checkId]) => checkId);
+  if (result.checks.some((check) => check.status === "failed" && config.checks[check.category]?.required)) return "needs_changes";
+  // 以下都属于“无法确认”：缺少必需检查、必需检查未完成、专家或汇总未完成。
+  // 这些规则统一排在阻断证据之后，避免任何一个环节的缺失掩盖已经发现的高等级问题。
   if (requiredCheckIds.some((checkId) => !result.checks.some((check) => check.checkId === checkId))) return "inconclusive";
   if (result.checks.some((check) => config.checks[check.category]?.required && (check.status === "environment_error" || check.status === "timed_out" || check.status === "skipped"))) return "inconclusive";
-  if (result.checks.some((check) => check.status === "failed" && config.checks[check.category]?.required)) return "needs_changes";
-  // 先看已经拿到的确定性阻断证据：只要存在 high/critical+verified，就应该给出可操作的阻断结论。
-  if (result.findings.some((finding) => (finding.severity === "critical" || finding.severity === "high") && finding.verificationStatus === "verified")) return "needs_changes";
-  // 编排不完整意味着无法给出“通过”语义，专家和汇总两个环节同等对待。
-  // 这两条刻意排在阻断证据之后：否则“汇总失败”会掩盖已经发现的 high+verified 问题。
   if (result.limitations.some((item) => item.startsWith("agent_orchestration:"))) return "inconclusive";
   if (result.limitations.some((item) => item.startsWith("专家 Agent ") && item.includes("未完成"))) return "inconclusive";
   return result.findings.length > 0 ? "approve_with_notes" : "approve";

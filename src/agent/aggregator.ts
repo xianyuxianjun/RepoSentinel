@@ -65,8 +65,9 @@ export function buildAggregatorPayload(successes: SpecialistResult[]): { payload
     limitations: result.limitations.slice(0, 20).map((item) => boundedPreview(item, 500)),
     nextActions: result.nextActions.slice(0, 20).map((item) => boundedPreview(item, 500)),
   }));
+  const droppedByCap = successes.reduce((total, { result }) => total + Math.max(0, result.findings.length - 30), 0); // 每个专家超过 30 条的 Finding 同样不会进入报告。
   let payloadChars = JSON.stringify(payload).length; // 汇总输入当前占用的字符数。
-  let truncatedFindings = 0; // 因超出预算而删除的 Finding 数量。
+  let truncatedFindings = droppedByCap; // 因超出下列限制而未进入报告的 Finding 数量。
   let trimmedSections = 0; // 因超出预算而删除的说明/摘要数量。
   // 第一层：优先删除 Finding，而不是删除角色和限制信息；这样仍能保留失败语义。
   while (payloadChars > MAX_AGGREGATOR_CONTEXT_CHARS && payload.some((item) => item.findings.length > 0)) {
@@ -109,6 +110,18 @@ export interface MergeAssemblyInput {
 }
 
 /**
+ * 高等级且已验证的 Finding 引用。
+ *
+ * 这些是“确定性阻断证据”，不允许被汇总模型的 keep 列表丢弃：否则模型就等于可以
+ * 自行宣布通过，与“模型只能提供证据、不能决定结论”的设计前提相道而驰。
+ */
+export function blockingRefs(originals: ReadonlyMap<string, Finding>): string[] {
+  return [...originals]
+    .filter(([, finding]) => (finding.severity === "critical" || finding.severity === "high") && finding.verificationStatus === "verified")
+    .map(([ref]) => ref);
+}
+
+/**
  * 按汇总方案组装最终结果。
  *
  * Finding 正文一律回查 originals 里的专家原文，模型只提供 keep 列表和摘要，
@@ -116,6 +129,9 @@ export interface MergeAssemblyInput {
  */
 export function assembleMergedResult(input: MergeAssemblyInput): ReviewResult {
   const keep = new Set(input.plan.keep); // 模型决定保留的 Finding 引用。
+  // 兜底：模型没保留的阻断证据一律补回来。模型仍可以对它们去重或排序，但无法让它们消失。
+  const protectedRefs = blockingRefs(input.originals).filter((ref) => !keep.has(ref));
+  for (const ref of protectedRefs) keep.add(ref);
   const findings: Finding[] = []; // 按汇总输入顺序组装的最终 Finding 列表。
   // 遍历 originals 而不是 keep，顺序才稳定；Map 的插入顺序就是专家结果的先后顺序。
   for (const [ref, original] of input.originals) {
@@ -128,6 +144,7 @@ export function assembleMergedResult(input: MergeAssemblyInput): ReviewResult {
   const nextActions = [...new Set([...input.specialists.flatMap(({ result }) => result.nextActions), ...input.plan.nextActions])];
   // 被裁掉的 Finding 不会进入报告，必须显式说明，否则读者会以为覆盖是完整的。
   if (input.truncatedFindings) limitations.unshift(`汇总输入超出 ${MAX_AGGREGATOR_CONTEXT_CHARS} 字符预算，${input.truncatedFindings} 条 Finding 未参与汇总，可能未出现在本报告中。`);
+  if (protectedRefs.length > 0) limitations.unshift(`汇总模型丢弃了 ${protectedRefs.length} 条 high/critical 且已验证的 Finding，已由确定性兜底保留。`);
   return {
     schemaVersion: 1,
     mergeRecommendation: "inconclusive", // 占位值，由 computeRecommendation 在编排层重新计算。
@@ -163,7 +180,7 @@ export async function runAggregatorAgent(input: MultiAgentRunInput, successes: S
   const plan = validateMergePlan(run.submitted, prepared.refs); // 已校验的汇总去重方案。
   const assembled = assembleMergedResult({ originals: prepared.originals, plan, checks: input.initialChecks ?? [], specialists: successes, truncatedFindings: prepared.truncatedFindings }); // 回查专家原文并按 ref 组装最终结果。
   const validated = validateReviewResult(assembled, input.initialChecks ?? [], input.context.changes.map((change) => change.path)); // 对组装结果做与专家一致的最终校验。
-  await input.trace.record("aggregator_merge_plan", { agentRole: "aggregator", totalRefs: prepared.refs.size, kept: plan.keep.length, dropped: prepared.refs.size - plan.keep.length });
+  await input.trace.record("aggregator_merge_plan", { agentRole: "aggregator", totalRefs: prepared.refs.size, kept: plan.keep.length, dropped: prepared.refs.size - plan.keep.length, protectedBlockingRefs: blockingRefs(prepared.originals).filter((ref) => !plan.keep.includes(ref)).length });
   await input.trace.record("agent_end", { agentRole: "aggregator", findings: validated.findings.length, checks: validated.checks.length, telemetry: run.telemetry });
   return { ...validated, telemetry: run.telemetry };
 }
